@@ -1,0 +1,268 @@
+{{ filter_bar_css|safe }}
+
+
+<!-- Offcanvas: Filter Builder -->
+<div class="offcanvas offcanvas-end" tabindex="-1" id="filter-bar-offcanvasTop" aria-labelledby="offcanvasTopLabel"
+     style="width: 780px;">
+    <div class="offcanvas-header pb-0">
+        <div class="filter-header">
+            <i class="ri-filter-3-line me-2"></i> Filter Builder
+        </div>
+        <button type="button" class="btn-close text-reset" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+
+    <div class="offcanvas-body pt-0">
+        <div class="row">
+            <div class="col-12 filter-builder">
+                {{ filter_form|safe }}
+                <!--
+                  Expected structure inside filter_form:
+                  <form class="filterForm">
+                    <div id="filterRows">
+                      <div class="field-group col-12 filter-row d-flex align-items-center gap-2">
+                        <select name="group[]">...</select>
+                        <select name="boolean[]">...</select>
+                        <select name="field[]">...</select>
+                        <select name="operator[]">...</select>
+                        <input  name="value[]" type="text" />
+                        <button type="button" class="btn btn-sm btn-link" onclick="removeFilterRow(this)">Remove</button>
+                      </div>
+                    </div>
+                    <div class="mt-2 d-flex gap-2">
+                      <button type="button" class="btn btn-outline-primary" onclick="addFilterRow()">Add filter</button>
+                      <button type="reset"  class="btn btn-outline-secondary">Reset</button>
+                      <button type="submit" class="btn btn-primary">Apply</button>
+                    </div>
+                  </form>
+                -->
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- If you need Bootstrap JS, uncomment:
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+-->
+
+<script>
+    (function () {
+        // -------- Template handling -------------------------------------------------
+        let FILTER_ROW_TEMPLATE = null;
+
+        function ensureTemplate() {
+            if (FILTER_ROW_TEMPLATE) return;
+            const byId = document.querySelector('#filterRows .filter-row');
+            if (byId) {
+                FILTER_ROW_TEMPLATE = byId.cloneNode(true);
+                sanitizeClonedRow(FILTER_ROW_TEMPLATE);
+                return;
+            }
+            // Legacy fallback if a ".filterRows" container is used somewhere else
+            const legacyContainer = document.querySelector('.filterRows');
+            if (legacyContainer && legacyContainer.children[0]) {
+                const wrapper = document.createElement('div');
+                wrapper.className = 'field-group col-12 filter-row d-flex align-items-center gap-2';
+                wrapper.innerHTML = legacyContainer.children[0].innerHTML;
+                sanitizeClonedRow(wrapper);
+                FILTER_ROW_TEMPLATE = wrapper;
+            }
+        }
+
+        function sanitizeClonedRow(row) {
+            // Clear values, re-enable inputs; keep selects at their first option
+            const selects = row.querySelectorAll('select');
+            selects.forEach(sel => {
+                if (sel.options.length) sel.value = sel.options[0].value;
+            });
+            const inputs = row.querySelectorAll('input[name="value[]"]');
+            inputs.forEach(inp => {
+                inp.value = '';
+                inp.disabled = false;
+            });
+        }
+
+        // -------- Row operations ----------------------------------------------------
+        window.addFilterRow = function addFilterRow(prefill = null) {
+            const container = document.getElementById('filterRows');
+            if (!container) return null;
+
+            ensureTemplate();
+            const row = FILTER_ROW_TEMPLATE ? FILTER_ROW_TEMPLATE.cloneNode(true) : document.createElement('div');
+
+            if (!FILTER_ROW_TEMPLATE) {
+                // Absolute fallback if no template found at all
+                row.className = 'field-group col-12 filter-row d-flex align-items-center gap-2';
+                row.innerHTML = `
+        <select name="group[]"></select>
+        <select name="boolean[]"></select>
+        <select name="field[]"></select>
+        <select name="operator[]"></select>
+        <input name="value[]" type="text" />
+        <button type="button" class="btn btn-sm btn-link" onclick="removeFilterRow(this)">Remove</button>
+      `;
+            }
+
+            // Prefill values if provided
+            const groupEl = row.querySelector('select[name="group[]"]');
+            const boolEl = row.querySelector('select[name="boolean[]"]');
+            const fieldEl = row.querySelector('select[name="field[]"]');
+            const opEl = row.querySelector('select[name="operator[]"]');
+            const valEl = row.querySelector('input[name="value[]"]');
+
+            if (groupEl && prefill?.group) trySetSelect(groupEl, prefill.group);
+            if (boolEl && prefill?.boolean) trySetSelect(boolEl, prefill.boolean);
+            if (fieldEl && prefill?.field) trySetSelect(fieldEl, prefill.field);
+            if (opEl && prefill?.operator) trySetSelect(opEl, prefill.operator);
+
+            if (valEl) {
+                valEl.value = prefill?.value ?? '';
+                if (opEl) valEl.disabled = String(opEl.value).includes('null');
+            }
+
+            container.appendChild(row);
+            if (opEl) toggleValueInput(opEl);
+            return row;
+        };
+
+        function trySetSelect(select, value) {
+            // Only set if option exists; otherwise keep default to avoid invalid state
+            const exists = Array.from(select.options).some(o => o.value === value);
+            if (exists) select.value = value;
+        }
+
+        // Disable/enable value input if operator is null-based
+        window.toggleValueInput = function toggleValueInput(select) {
+            const row = select.closest('.filter-row');
+            const valueInput = row?.querySelector('input[name="value[]"]');
+            if (!valueInput) return;
+            if (String(select.value).includes('null')) {
+                valueInput.value = '';
+                valueInput.disabled = true;
+            } else {
+                valueInput.disabled = false;
+            }
+        };
+
+        // Smoothly remove a filter row
+        window.removeFilterRow = function removeFilterRow(el) {
+            const rows = document.querySelectorAll('.filter-row');
+            if (rows.length <= 1) {
+                alert('You must have at least one filter row.');
+                return;
+            }
+            const row = el.closest('.filter-row');
+            if (!row) return;
+            row.style.transition = 'opacity 0.3s';
+            row.style.opacity = '0';
+            setTimeout(() => row.remove(), 300);
+        };
+
+        // -------- URL parsing & hydration ------------------------------------------
+        function parseFiltersFromLocation() {
+            const params = new URLSearchParams(window.location.search);
+            const collected = {};
+
+            for (const [key, value] of params.entries()) {
+                const m = key.match(/^filters\[(\d+)\]\[(group|boolean|field|operator|value)\]$/);
+                if (!m) continue;
+                const idx = Number(m[1]);
+                const prop = m[2];
+                if (!collected[idx]) collected[idx] = {};
+                collected[idx][prop] = value;
+            }
+
+            return Object.keys(collected)
+                .map(n => Number(n))
+                .sort((a, b) => a - b)
+                .map(n => collected[n]);
+        }
+
+        function hydrateFiltersFromQuery() {
+            const container = document.getElementById('filterRows');
+            if (!container) return;
+
+            ensureTemplate();
+
+            const filters = parseFiltersFromLocation();
+            if (filters.length) {
+                // Cache current scroll to avoid jumps (optional)
+                const y = window.scrollY;
+                container.innerHTML = '';
+                filters.forEach(f => addFilterRow(f));
+                window.scrollTo({top: y});
+            } else {
+                // Ensure at least one row exists
+                if (!container.querySelector('.filter-row')) addFilterRow();
+            }
+        }
+
+        // -------- Form wiring (submit/reset) ---------------------------------------
+        function wireFormEvents() {
+            const form = document.querySelector('.filterForm');
+            if (!form) return;
+
+            // Reset -> always leave one row
+            form.addEventListener('reset', function () {
+                setTimeout(() => {
+                    const container = document.getElementById('filterRows');
+                    if (!container) return;
+                    container.innerHTML = '';
+                    addFilterRow();
+                });
+            });
+
+            // Submit -> Convert filters to query params with group IDs
+            form.addEventListener('submit', function (e) {
+                e.preventDefault();
+
+                const rows = document.querySelectorAll('#filterRows .filter-row');
+                const filters = [];
+
+                rows.forEach(row => {
+                    const group = row.querySelector('select[name="group[]"]')?.value ?? '';
+                    const field = row.querySelector('select[name="field[]"]')?.value ?? '';
+                    const boolean = row.querySelector('select[name="boolean[]"]')?.value || 'AND';
+                    const operator = row.querySelector('select[name="operator[]"]')?.value ?? '';
+                    const value = row.querySelector('input[name="value[]"]')?.value ?? '';
+
+                    if (field && (String(operator).includes('null') || value.trim() !== '')) {
+                        filters.push({group, boolean, field, operator, value});
+                    }
+                });
+
+                if (!filters.length) {
+                    alert('Please add at least one valid filter condition.');
+                    return;
+                }
+
+                const params = new URLSearchParams();
+                filters.forEach((f, i) => {
+                    params.append(`filters[${i}][group]`, f.group);
+                    params.append(`filters[${i}][boolean]`, f.boolean);
+                    params.append(`filters[${i}][field]`, f.field);
+                    params.append(`filters[${i}][operator]`, f.operator);
+                    if (!String(f.operator).includes('null')) {
+                        params.append(`filters[${i}][value]`, f.value);
+                    }
+                });
+
+                // Redirect with query string
+                window.location.href = `?${params.toString()}`;
+            });
+
+            // Delegated: keep value input toggling in sync when operator changes
+            form.addEventListener('change', function (e) {
+                if (e.target && e.target.matches('select[name="operator[]"]')) {
+                    toggleValueInput(e.target);
+                }
+            });
+        }
+
+        // -------- Init --------------------------------------------------------------
+        document.addEventListener('DOMContentLoaded', function () {
+            ensureTemplate();
+            hydrateFiltersFromQuery();
+            wireFormEvents();
+        });
+    })();
+</script>

@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <title>{{ env('APP_NAME') }} - {{ env('APP_TAGLINE') }}</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+
+    <!-- Bootstrap Zephyr Theme -->
+    <link rel="stylesheet" href="https://bootswatch.com/5/zephyr/bootstrap.min.css">
+
+    <!-- Remix Icons -->
+    <link rel="stylesheet"
+          href="https://cdnjs.cloudflare.com/ajax/libs/remixicon/4.6.0/remixicon.min.css"
+          integrity="sha512-XcIsjKMcuVe0Ucj/xgIXQnytNwBttJbNjltBV18IOnru2lDPe9KRRyvCXw6Y5H415vbBLRm8+q6fmLUU7DfO6Q=="
+          crossorigin="anonymous" referrerpolicy="no-referrer"/>
+
+    <!-- Trix Editor -->
+    <link rel="stylesheet" href="https://unpkg.com/trix@2.0.8/dist/trix.css">
+    <script src="https://unpkg.com/trix@2.0.8/dist/trix.umd.min.js"></script>
+
+
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Rethink+Sans:ital,wght@0,400..800;1,400..800&display=swap"
+          rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Nunito+Sans:wght@200;300;400;600;700;800;900&display=swap"
+          rel="stylesheet">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap">
+
+    <!-- HTMX -->
+    <script src="https://unpkg.com/htmx.org@2.0.2"></script>
+
+    <style>
+        embed {
+            width: 100%;
+            /*height: 40svh;*/
+            border: none;
+        }
+    </style>
+
+    <!-- jQuery -->
+    {% include 'styles.html' %}
+
+
+
+
+
+    {% block css %}
+
+    {% endblock %}
+
+    <script>
+        document.addEventListener("DOMContentLoaded", function (event) {
+
+            const showNavbar = (toggleId, navId, bodyId, headerId) => {
+                const toggle = document.getElementById(toggleId),
+                    nav = document.getElementById(navId),
+                    closed_nav_logo = document.getElementById('closed_nav_logo'),
+                    bodypd = document.getElementById(bodyId),
+                    headerpd = document.getElementById(headerId)
+
+// Validate that all variables exist
+                if (toggle && nav && bodypd && headerpd) {
+                    toggle.addEventListener('click', () => {
+// show navbar
+                        nav.classList.toggle('show')
+                        closed_nav_logo.classList.toggle("d-none")
+// change icon
+                        toggle.classList.toggle('bx-x')
+// add padding to body
+                        bodypd.classList.toggle('body-pd')
+// add padding to header
+                        headerpd.classList.toggle('body-pd')
+                    })
+                }
+            }
+
+            showNavbar('header-toggle', 'nav-bar', 'body-pd', 'header')
+
+            /*===== LINK ACTIVE =====*/
+            const linkColor = document.querySelectorAll('.nav_link')
+
+            function colorLink() {
+                if (linkColor) {
+                    linkColor.forEach(l => l.classList.remove('active'))
+                    this.classList.add('active')
+                }
+            }
+
+            linkColor.forEach(l => l.addEventListener('click', colorLink))
+
+            // Your code to run since DOM is loaded and ready
+        });
+    </script>
+</head>
+<body id="body-pd" class="body-pd" style="background: #eeeeee">
+
+<header class="header body-pd" id="header">
+    <div class="header_toggle"><i class='bx bx-menu' id="header-toggle"></i></div>
+    <div class="header_img"><img
+            src="https://ui-avatars.com/api/?name={{ session.get('TenantId') }}&length=4&font-size=0.33" alt=""></div>
+</header>
+<div class="l-navbar show" id="nav-bar">
+    <nav class="nav">
+        <div>
+            <a href="#" class="nav_logo">
+                <img id="closed_nav_logo" src="{{ env('LOGO_URL_PATH') + env('LOGO_URL_FILE') }}" alt="" height="72">
+                <span class="nav_logo-name">
+                <img src="{{ env('LOGO_URL_PATH') + env('LOGO_URL_FILE') }}" alt="" height="72">
+            </span>
+            </a>
+            {% set grouped = {} %}
+            {% set ungrouped = [] %}
+
+            {# Separate navigation into grouped and ungrouped #}
+            {% for item in navigation %}
+                {% if item.get("visible") %}
+                    {% if item.get("group") %}
+                        {% set group_name = item.group %}
+                        {% if group_name not in grouped %}
+                            {% set grouped = grouped.update({group_name: [item]}) or grouped %}
+                        {% else %}
+                            {% set _ = grouped[group_name].append(item) %}
+                        {% endif %}
+                    {% else %}
+                        {% set _ = ungrouped.append(item) %}
+                    {% endif %}
+                {% endif %}
+            {% endfor %}
+
+            <div class="nav_list">
+
+                {# Render ungrouped items #}
+                {% for item in ungrouped %}
+                    <a href="{{ item.url }}" class="nav_link">
+                        <i class="{{ item.icon }} nav_icon"></i>
+                        <span class="nav_name">{{ item.title }}</span>
+                    </a>
+                {% endfor %}
+
+                {# Render grouped items #}
+                {% for group_name, items in grouped.items() %}
+                    {% set collapse_id = "collapse_" ~ loop.index %}
+
+                    <a href="#" class="nav_link" data-bs-toggle="collapse"
+                       data-bs-target="#{{ collapse_id }}" aria-expanded="false"
+                       aria-controls="{{ collapse_id }}">
+                        <i class="{{ items[0].get('group_icon', 'ri-question-line') }} nav_icon"></i>
+                        <span class="nav_name">{{ group_name }}</span>
+                    </a>
+
+                    <div class="collapse" id="{{ collapse_id }}">
+                        {% for item in items %}
+                            <a href="{{ item.url }}" class="nav_link ps-4" style="font-size: 12px; margin-left: 1rem;">
+                                <i class="{{ item.icon }} nav_icon"></i>
+                                <span class="nav_name">{{ item.title }}</span>
+                            </a>
+                        {% endfor %}
+                    </div>
+                {% endfor %}
+
+            </div>
+
+        </div>
+        <a href="/logout" class="nav_link"> <i class="ri-logout-box-line nav_icon"></i> <span
+                class="nav_name">Log Out</span>
+        </a>
+    </nav>
+
+</div>
+
+
+<div class="container-fluid my-5 py-3 card shadow"
+     style="background-color: #ffffff80 !important; margin-top: 6rem !important;">
+
+    {% block content %}
+
+    {% endblock %}
+
+</div>
+
+<script src="https://unpkg.com/lucide@latest"></script>
+<script>
+    (function () {
+        //htmx.config.globalViewTransitions = true;
+
+        document.addEventListener('trix-file-accept', function (event) {
+            event.preventDefault();
+            alert('File attachment is not allowed.');
+        });
+
+
+    })();
+</script>
+
+<script>
+    /**
+     * Adds a double-click event listener to each row in a table and passes a specific field's value to the callback.
+     * @param {string} tableId - The ID of the table.
+     * @param {function} callback - A callback function to handle the double-click event. It receives the field value and the row as parameters.
+     */
+    function addRowDoubleClickHandler(tableId, callback) {
+        // Get the table by its ID
+        const table = document.getElementById(tableId);
+        const tableOptions = JSON.parse(table.getAttribute('data-framework1-options').replace(/'/g, '"'));
+        const fieldName = tableOptions['keyId'];
+
+        if (!table) {
+            console.error(`Table with ID "${tableId}" not found.`);
+            return;
+        }
+
+        // Get all the rows in the table body
+        const rows = table.getElementsByTagName('tbody')[0]?.getElementsByTagName('tr');
+
+        if (!rows || rows.length === 0) {
+            console.warn(`No rows found in the table with ID "${tableId}".`);
+            return;
+        }
+
+        // Add a double-click event listener to each row
+        for (const row of rows) {
+            row.addEventListener('dblclick', () => {
+                // Find the cell with the matching `data-framework1-field-name`
+                const targetCell = Array.from(row.children).find(
+                    (cell) => cell.getAttribute('data-framework1-field-name') === fieldName
+                );
+
+                if (!targetCell) {
+                    console.warn(`Field "${fieldName}" not found in row.`);
+                    return;
+                }
+
+                // Pass the field value and row to the callback
+                const fieldValue = targetCell.textContent.trim(); // or use innerText
+                callback(fieldValue, row);
+            });
+        }
+    }
+
+
+    // find all tables in the document then loop through them and add the double-click event listener
+    document.querySelectorAll('table').forEach((table) => {
+        addRowDoubleClickHandler(table.id, (fieldValue, row) => {
+            console.log(`Field value: ${fieldValue}`, 'Row:', row);
+        });
+    });
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
+        integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz"
+        crossorigin="anonymous"></script>
+
+
+<script>
+    var tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'))
+    var tooltipList = tooltipTriggerList.map(function (tooltipTriggerEl) {
+        return new bootstrap.Tooltip(tooltipTriggerEl)
+    })
+</script>
+
+<script>
+    document.addEventListener('DOMContentLoaded', function () {
+        document.querySelector('.select-all').addEventListener('change', function (e) {
+            const checked = e.target.checked;
+            document.querySelectorAll('.row-select').forEach(cb => cb.checked = checked);
+        });
+
+        document.getElementById('bulk-delete-form').addEventListener('submit', function (e) {
+            const ids = Array.from(document.querySelectorAll('.row-select:checked')).map(cb => cb.value);
+            if (ids.length === 0) {
+                e.preventDefault();
+                alert('No rows selected!');
+                return;
+            }
+            document.getElementById('bulk-delete-ids').value = ids.join(',');
+        });
+    });
+</script>
+
+
+<script>
+    document.querySelectorAll("textarea").forEach((textarea, index) => {
+        // Create hidden input
+        const hiddenInput = document.createElement("input");
+        hiddenInput.type = "hidden";
+        hiddenInput.name = textarea.name;
+        hiddenInput.id = `trix-input-${index}`;
+        hiddenInput.value = textarea.value;  // ✅ Set initial value!
+
+        // Create trix-editor linked to the hidden input
+        const trixEditor = document.createElement("trix-editor");
+        trixEditor.setAttribute("input", hiddenInput.id);
+
+        // Insert hidden input + trix editor after textarea
+        textarea.insertAdjacentElement("afterend", hiddenInput);
+        hiddenInput.insertAdjacentElement("afterend", trixEditor);
+
+        // Remove the textarea
+        textarea.remove();
+    });
+</script>
+
+
+<script>
+    let resourceActionPanel = document.getElementById('resource-action-panel');
+    if (resourceActionPanel.children[0].textContent.trim() === "Filter" && !document.getElementById("filter-bar-offcanvasTop")) {
+        // add class to resourceActionPanel.children[0] to disable the button
+        resourceActionPanel.children[0].classList.add('disabled');
+    } else if (resourceActionPanel.children[0].textContent.trim() !== "Filter" && document.getElementById("filter-bar-offcanvasTop")) {
+        // prepend filter button to resourceActionPanel
+        resourceActionPanel.insertAdjacentHTML('afterbegin', `
+            <button type="button" class="btn btn-light" data-bs-toggle="offcanvas" data-bs-target="#filter-bar-offcanvasTop">
+                <!-- filter button using ri line icons -->
+                <i class="ri-filter-2-line"></i> Filter
+            </button>
+        `);
+    } else {
+
+    }
+</script>
+
+</body>
+</html>

@@ -1,0 +1,16 @@
+<div class="dropdown mt-3">
+    <button class="btn btn-light  dropdown-toggle" type="button" id="dropdownMenuButton1"
+            data-bs-toggle="dropdown" aria-expanded="false"
+            style="padding: 0; background: transparent; border: none; box-shadow: none;">
+        <i class="fa fa-filter"></i>
+    </button>
+    <ul class="dropdown-menu" aria-labelledby="dropdownMenuButton1">
+        <li>
+            <form class="container">
+                <div><strong>Filters</strong> <a href="{reset_url}" class="text-danger small">Reset</a></div>
+                {inputs}
+                <button type="submit" class="btn btn-warning btn-sm mt-1">Apply filters</button>
+            </form>
+        </li>
+    </ul>
+</div>

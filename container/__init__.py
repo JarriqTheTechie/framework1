@@ -1,0 +1,1 @@
+from ..service_container._Injector import injector, singleton

@@ -1,0 +1,59 @@
+{% set table_state = request.grouped(table_name).get(table_name, {}) %}
+{% set current_page = table_state.get("page", 1) | int %}
+
+<nav aria-label="Page navigation" class="mt-3">
+    <div class="d-flex align-items-center justify-content-between">
+        <div class="pagination-info">
+            Showing {{ data|length }} of {{ total }} items
+        </div>
+        <ul class="pagination mb-0">
+            <!-- Previous button -->
+            <li class="page-item {% if current_page <= 1 %}disabled{% endif %}">
+                <a class="page-link"
+                   href="{{ request.clean_table_url(table_name, {'page': current_page - 1}) }}"
+                   {% if current_page <= 1 %}tabindex="-1"{% endif %}>
+                    Previous
+                </a>
+            </li>
+
+            {# Always show first page #}
+            <li class="page-item {% if current_page == 1 %}active{% endif %}">
+                <a class="page-link" href="{{ request.clean_table_url(table_name, {'page': 1}) }}">1</a>
+            </li>
+
+            {# Left ellipsis #}
+            {% if current_page > 4 %}
+                <li class="page-item disabled"><span class="page-link">…</span></li>
+            {% endif %}
+
+            {# Window around current page #}
+            {% for p in range(current_page - 2, current_page + 3) %}
+                {% if p > 1 and p < last_page %}
+                    <li class="page-item {% if p == current_page %}active{% endif %}">
+                        <a class="page-link" href="{{ request.clean_table_url(table_name, {'page': p}) }}">{{ p }}</a>
+                    </li>
+                {% endif %}
+            {% endfor %}
+
+            {# Right ellipsis #}
+            {% if current_page < last_page - 3 %}
+                <li class="page-item disabled"><span class="page-link">…</span></li>
+            {% endif %}
+
+            {# Always show last page if > 1 #}
+            {% if last_page > 1 %}
+                <li class="page-item {% if current_page == last_page %}active{% endif %}">
+                    <a class="page-link" href="{{ request.clean_table_url(table_name, {'page': last_page}) }}">{{ last_page }}</a>
+                </li>
+            {% endif %}
+
+            <!-- Next button -->
+            <li class="page-item {% if current_page >= last_page %}disabled{% endif %}">
+                <a class="page-link"
+                   href="{{ request.clean_table_url(table_name, {'page': current_page + 1}) }}">
+                    Next
+                </a>
+            </li>
+        </ul>
+    </div>
+</nav>
