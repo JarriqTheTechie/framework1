@@ -127,7 +127,6 @@ class QueryBuilder:
 
         # Copy lists
         cloned.conditions = self.conditions[:]
-        cloned.conditions = self.conditions[:]
         cloned.parameters = self.parameters[:]
         cloned.having_conditions = self.having_conditions[:]
         cloned.group_by_columns = self.group_by_columns[:]
@@ -807,11 +806,15 @@ class QueryBuilder:
         self.limit_count = None
         self.offset_count = None
         self.rows_fetch = None
-
-        # Remove any previous pagination parameters
-        self.parameters = [p for p in self.parameters
-                           if not isinstance(p, int) or
-                           p not in {per_page, (page - 1) * per_page}]
+        if not hasattr(self, "_pagination_params"):
+            self._pagination_params = []
+        # Remove previously injected pagination params by identity, not value
+        for p in getattr(self, "_pagination_params", []):
+            try:
+                self.parameters.remove(p)
+            except ValueError:
+                pass
+        self._pagination_params = []
 
         offset = (page - 1) * per_page
 
@@ -821,15 +824,19 @@ class QueryBuilder:
                 raise ValueError("MSSQL requires ORDER BY clause for pagination.")
             self.offset_count = "%s"
             self.parameters.append(offset)
+            self._pagination_params.append(offset)
 
             self.rows_fetch = "%s"
             self.parameters.append(per_page)
+            self._pagination_params.append(per_page)
         else:
             self.limit_count = "%s"
             self.parameters.append(per_page)
+            self._pagination_params.append(per_page)
 
             self.offset_count = "%s"
             self.parameters.append(offset)
+            self._pagination_params.append(offset)
 
         return self
 

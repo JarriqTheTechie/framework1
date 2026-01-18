@@ -238,8 +238,8 @@ class BulkPreloader:
                 q.pop("db")
                 q.pop("db_instance")
                 if p:
-                    qset.append(q)
                     params.extend(p)
+                qset.append(q)
 
             results.extend(db_instance.pquery(qset, *params))
 

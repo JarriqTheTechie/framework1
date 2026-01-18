@@ -1417,20 +1417,12 @@ class ActiveRecord(QueryBuilder, Events,
         if is_instance:
             # Instance update path
             for key, value in values.items():
-                print(key, value)
                 self.__data__[key] = value
 
             self.fire_event("updating", self)
             self.fire_event("saving", self)
 
             sql, params = super().update(values)
-
-            if "processed_count" in sql:
-                print(f"{sql} with args {params}")
-
-            if isinstance(params, list):
-                # params = [p for p in params if p != 1]
-                pass
 
             self.db.query(sql, params)
             self.db.connection.commit()
@@ -1471,9 +1463,6 @@ class ActiveRecord(QueryBuilder, Events,
         # Fast bulk update with no events
         else:
             sql, params = super().update(values)
-            if isinstance(params, list):
-                params = [p for p in params if p != 1]
-
             self.db.query(sql, params)
             self.db.connection.commit()
             self.__original__ = self.__data__.copy()
@@ -1493,7 +1482,6 @@ class ActiveRecord(QueryBuilder, Events,
         - Query-based deletes with optional lifecycle events.
         """
         self.remove_limit()
-        self.parameters = [p for p in self.parameters if p != 1]
         pk = self.get_primary_key_column()
 
         is_find_based = False
