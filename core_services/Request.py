@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from flask import request, flash, session, get_flashed_messages
 from framework1.core_services.validators import get_rule
 from werkzeug.datastructures import FileStorage
+from werkzeug.utils import secure_filename
 
 COMMON_DATE_FORMATS = [
     "%Y-%m-%d",
@@ -57,19 +58,20 @@ class UploadedFile:
         base_dir = upload_dir or os.getenv("UPLOAD_DIR") or "uploads"
         os.makedirs(base_dir, exist_ok=True)
 
-        extension: str = self.extension()
+        original_name = secure_filename(self.file.filename or "")
         if keep_name is True:
-            path = base_dir + "/" + self.file.filename
+            filename = original_name or str(uuid.uuid4())
         else:
-            path = base_dir + "/" + f"{prefix}{prefix_separator}{path or str(uuid.uuid4())}{suffix_separator}{suffix}" + "." + extension
-            path = path.strip()
+            name_component = path or str(uuid.uuid4())
+            combined = f"{prefix}{prefix_separator}{name_component}{suffix_separator}{suffix}".strip()
+            filename = secure_filename(combined) or secure_filename(original_name) or str(uuid.uuid4())
+            extension: str = secure_filename(self.extension() or "")
+            if extension:
+                filename = f"{filename}.{extension}"
 
-        if path:
-            self.file.save(path)
-        else:
-            self.file.save(self.file.filename)
-
-        return path
+        final_path = os.path.join(base_dir, filename)
+        self.file.save(final_path)
+        return final_path
 
     def extension(self):
         return self.file.filename.split('.')[-1]
@@ -99,12 +101,49 @@ class UploadedFile:
 
 
 class Request:
+    class _SessionAdapter:
+        def __init__(self, backing):
+            self._backing = backing
+
+        def __call__(self):
+            return self._backing
+
+        def __getattr__(self, item):
+            return getattr(self._backing, item)
+
+        def __getitem__(self, item):
+            return self._backing[item]
+
+        def __setitem__(self, key, value):
+            self._backing[key] = value
+
+        def __contains__(self, key):
+            return key in self._backing
+
+        def get(self, key, default=None):
+            return self._backing.get(key, default)
+
+        def items(self):
+            return self._backing.items()
+
+        def keys(self):
+            return self._backing.keys()
+
+        def values(self):
+            return self._backing.values()
+
+        def __iter__(self):
+            return iter(self._backing)
+
+        def __len__(self):
+            return len(self._backing)
+
     def __init__(self):
         # Access flask.request via the property; no setup needed
         if not request:
             raise RuntimeError("Request helper must be used within a Flask request context.")
         self.request.flash = flash
-        self.request.session = session
+        self.request.session = self._SessionAdapter(session)
 
     def __get_json(self):
         content_type = (self.request.content_type or "").lower()
@@ -128,6 +167,7 @@ class Request:
 
     def input(self, key, default=None, cast: type = None) -> Any:
         value = None
+        view_args = self.request.view_args or {}
 
         if "[]" in key:
             if key in self.request.form:
@@ -135,8 +175,8 @@ class Request:
             elif key in self.request.args:
                 value = self.request.args.getlist(key)
 
-        elif key in self.request.view_args:
-            value = self.request.view_args[key]
+        elif key in view_args:
+            value = view_args[key]
 
         elif key in self.request.args:
             value = self.request.args[key]
@@ -315,12 +355,11 @@ class Request:
         return default
 
     def all(self) -> dict:
-        data = {
-            **self.request.view_args,
-            **self.request.args,
-            **self.request.form,
-            **self.__get_json()
-        }
+        json_data = self.__get_json() or {}
+        data = {}
+        for mapping in (self.request.view_args, self.request.args, self.request.form, json_data if isinstance(json_data, dict) else {}):
+            if mapping:
+                data.update(mapping)
 
         # Extract list-style keys from both args and form
         list_params = {}
@@ -524,7 +563,7 @@ class Request:
 
     @property
     def session(self):
-        return session
+        return self.request.session
 
     def flash(self):
         flash(self.all(), "old")
@@ -543,9 +582,6 @@ class Request:
             return val.get(key, default)
         except IndexError:
             return default
-
-    def session(self):
-        return self.request.session
 
     def cookie(self, key: str, default=None) -> Any:
         return self.request.cookies.get(key, default)
@@ -682,10 +718,10 @@ class Request:
                     else:
                         valid = rule_fn(value)
 
-                    # If validation failed
-                    if not valid:
+                    # Treat non-True/non-None return or explicit message as an error
+                    if valid not in (None, True):
                         errors.setdefault(field, []).append(
-                            message or f"{field} is invalid"
+                            message or (valid if isinstance(valid, str) else f"{field} is invalid")
                         )
 
                 except Exception:

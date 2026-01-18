@@ -60,14 +60,8 @@ class MySqlDatabase(Database):
             self._cleanup()
 
     def pquery(self, queries, *args):
-        # Convert args to list if it's not already
-        args_list = list(args)
-
-        # if queries is a dictionary convert to list of dictionaries with multiple keys then turn into a list of dictionaries
         if isinstance(queries, dict):
             queries = [{k: v} for k, v in queries.items()]
-            #raise Exception(queries)
-
 
         keys = []
         for key in queries:
@@ -79,28 +73,22 @@ class MySqlDatabase(Database):
 
         queries = [f"{v}" for k, v in merged.items()]
 
-        # Count total placeholders and verify we have enough parameters
+        params = list(args)
+        if len(params) == 1 and isinstance(params[0], (list, tuple)):
+            params = list(params[0])
+
         total_placeholders = sum(query.count('%s') for query in queries)
-        if total_placeholders != len(args_list):
-            # If we have only one argument and multiple queries, replicate it
-            if len(args_list) == 1 and total_placeholders > 1:
-                args_list = args_list * total_placeholders
-            else:
-                # Otherwise, adjust the number of parameters to match placeholders
-                args_list = args_list[:total_placeholders]
+        if total_placeholders != len(params):
+            raise ValueError(f"Expected {total_placeholders} parameters for pquery, received {len(params)}.")
 
-        # Build final SQL batch
         final_query = "; ".join(queries)
-
-
-        # self.logger.info(f"PQUERY [PRE-EXECUTION] {final_query}")
 
         cur = self.connect()
         start_time = time.perf_counter()
         try:
-            cur.execute(final_query, tuple(args_list))
+            cur.execute(final_query, tuple(params))
             elapsed_ms = (time.perf_counter() - start_time) * 1000
-            self._log_query(final_query, args_list, elapsed_ms, event_name="sql_pquery")
+            self._log_query(final_query, params, elapsed_ms, event_name="sql_pquery")
 
             all_results = []
             resultset = cur.fetchall()
