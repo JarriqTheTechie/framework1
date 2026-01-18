@@ -3,7 +3,7 @@ from decimal import Decimal, InvalidOperation
 from framework1.database.ActiveRecord import ActiveRecord
 from framework1.database.active_record.utils.ModelCollection import ModelCollection
 from framework1.database.QueryBuilder import QueryBuilder
-from typing import Union
+from typing import Union, Any, List
 
 from framework1.utilities.DataKlass import DataKlass
 from markupsafe import Markup
@@ -42,6 +42,9 @@ class InfoListField:
         self._hidden = False
         if hide_if_empty:
             self.hide_if_empty(default_value)
+
+        self._empty_state = None
+        self._empty_html = None
 
     def name(self):
         return self.__name
@@ -344,7 +347,7 @@ class InfoListField:
 
 
 class InfoList:
-    def __init__(self, data: list[dict] | list[DataKlass] | list[ActiveRecord] | QueryBuilder = None, non_activerecord_model=None):
+    def __init__(self, data: list[DataKlass] | list[ActiveRecord] | QueryBuilder | List[dict[str, Any]] = None, non_activerecord_model=None):
         self.pagination = None
         self.data = data
         self.query = None
@@ -357,9 +360,24 @@ class InfoList:
         self._infolist_body_class_from_field = "col-8"
         self._infolist_label_class_from_field = "col-4"
 
+        self._data_attributes_headers = {}
+
         # New grid config
         self._grid_mode = False
         self._grid_columns = 3  # default 3 per row
+
+    def explode_data_attributes(self) -> str:
+        """Return all data attributes in HTML format."""
+        return " ".join([f'{key}="{value}"' for key, value in self._data_attributes_headers.items()])
+
+    def set_header_data_attribute(self, key: str, value: str, js_inline=False) -> 'BaseField':
+        """Set a data attribute for the field."""
+        if not js_inline:
+            self._data_attributes_headers[key] = value
+        else:
+            self._data_attributes_headers[key] = self.js_inline(value).rstrip(";").strip()
+            print(self.js_inline(value).rstrip(";").strip())
+        return self
 
     def set_style(self, style: str):
         self._style = style
@@ -529,6 +547,8 @@ class InfoList:
         self._infolist_body_class_from_field = class_name
         return self
 
+
+
     # --- Rendering ---
     def render(self):
         fields = self.schema()
@@ -548,8 +568,55 @@ class InfoList:
         icon = self._icon(data) if callable(self._icon) else self._icon
         classes = self._container_class
 
+        # ───────────────────────────────
+        # CLASS-BASED EMPTY STATE SUPPORT
+        # ───────────────────────────────
+        if not data:
+            # Detect whether empty() was overridden on the subclass
+            is_overridden = type(self).empty is not InfoList.empty
+
+            # If overridden, call subclass implementation
+            if is_overridden:
+                empty_html = self.empty()
+            else:
+                empty_html = None
+
+            # Default fallback
+            if not empty_html:
+                empty_html = "<p class=''>No data available.</p>"
+
+            # Resolve dynamic heading, footer, icons
+            heading = self._heading(data) if callable(self._heading) else self._heading
+            footer = self._footer(data) if callable(self._footer) else self._footer
+            icon = self._icon(data) if callable(self._icon) else self._icon
+
+            heading_html = (
+                f"""<div class="card-header bg-white {self._heading_class}">
+                        {f'<i class="{icon} nav_icon"></i>' if icon else ''}
+                        {heading}
+                    </div>"""
+                if heading else ""
+            )
+
+            footer_html = (
+                f"""<div class="card-footer text-muted {self._footer_class}">
+                        {footer}
+                    </div>"""
+                if footer else ""
+            )
+
+            return f"""
+                <div class="{self._container_class}" {self.explode_data_attributes()}>
+                    {heading_html}
+                    <div class="card-body text-center py-5">
+                        {empty_html}
+                    </div>
+                    {footer_html}
+                </div>
+            """
+
         html = f"""
-        <div class="{classes}" style="{self._style if hasattr(self, '_style') else ''}">
+        <div class="{classes}" style="{self._style if hasattr(self, '_style') else ''}" {self.explode_data_attributes()}>
             {f'<div class="card-header bg-white {self._heading_class}"><i class="{icon} nav_icon"></i> {heading}</div>' if heading else ''}
             <div class="card-body">
         """
@@ -561,9 +628,29 @@ class InfoList:
             for record in data:
                 record = DataKlass(record)
                 for field in fields:
-                    value = record.get(field.name(), "")
+                    if "." in field.name():
+                        # Support nested fields like 'user.name'
+                        parts = field.name().split(".")
+                        value = record
+                        for part in parts:
+                            value = value.get(part, "")
+                            if not value:
+                                break
+                    else:
+                        value = record.get(field.name(), "")
+
+
                     label = field.header()
                     label_text = label(value, record) if callable(label) else label
+                    if isinstance(field._hidden, bool):
+                        is_hidden = field._hidden
+                    elif callable(field._hidden):
+                        is_hidden = field._hidden(value, record)
+                    if not is_hidden:
+                        if getattr(field, '_is_separator', False):
+                            html += "<div class='col-12'><hr class='my-1'></div>"
+                            continue
+
                     html += f"""
                         <div class="{col_class}">
                             <div class="fw-bold">{label_text}</div>
@@ -575,7 +662,25 @@ class InfoList:
             html += '<div class="row">'
             for record in data:
                 for field in fields:
-                    value = getattr(record, field.name(), "")
+                    if "." in field.name():
+                        # Support nested fields like 'user.name'
+                        parts = field.name().split(".")
+                        value = record
+                        for part in parts:
+                            try:
+                                value = value.get(part, "")
+                            except TypeError:
+                                value = getattr(value, part, "")
+                            except AttributeError:
+                                #raise Exception(value(), part)
+                                value = getattr(value, part, "")
+                            if not value:
+                                break
+                    else:
+                        try:
+                            value = record.get(field.name(), "")
+                        except TypeError:
+                            value = getattr(record, field.name(), "")
 
                     label = field.header()
                     label_text = label(value, record) if callable(label) else label
@@ -597,6 +702,9 @@ class InfoList:
         </div>
         """
         return html
+
+    def empty(self) -> str:
+        pass
 
     def __str__(self) -> str:
         return self.render()

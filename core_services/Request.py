@@ -122,7 +122,9 @@ class Request:
         value = None
 
         if "[]" in key:
-            if key in self.request.args:
+            if key in self.request.form:
+                value = self.request.form.getlist(key)
+            elif key in self.request.args:
                 value = self.request.args.getlist(key)
 
         elif key in self.request.view_args:
@@ -167,6 +169,9 @@ class Request:
                 return default
 
         return value
+
+    def view_args(self, key, default=None) -> Any:
+        return self.request.view_args.get(key, default)
 
     def query(self, key, default=None) -> Any:
         if "[]" in key:
@@ -309,12 +314,16 @@ class Request:
             **self.__get_json()
         }
 
-        # Extract only the list-style keys (ending with '[]')
-        list_params = {
-            key: request.args.getlist(key)
-            for key in data.keys()
-            if key.endswith("[]")
-        }
+        # Extract list-style keys from both args and form
+        list_params = {}
+
+        for key in set(list(self.request.args.keys()) + list(self.request.form.keys())):
+            if key.endswith("[]"):
+                if key in self.request.form:
+                    list_params[key] = self.request.form.getlist(key)
+                elif key in self.request.args:
+                    list_params[key] = self.request.args.getlist(key)
+
         data.update(list_params)
 
         return {key: value for key, value in data.items() if value != ''}
@@ -459,6 +468,11 @@ class Request:
 
     def path(self) -> str:
         return self.request.path
+
+    def base_path(self) -> str:
+        path = self.request.path.strip("/")
+        parts = path.split("/", 1)
+        return f"/{parts[0]}" if parts else "/"
 
     def url(self) -> str:
         return self.request.url
@@ -628,23 +642,45 @@ class Request:
     def validate(self, schema: dict[str, list]) -> dict[str, list[str]]:
         errors = {}
         data = self.all()
+
         for field, rules in schema.items():
             value = self.input(field)
+
             for rule in rules:
+                rule_fn = None
+                message = None
+
+                # Rule can be string, function, or (function, message)
                 if isinstance(rule, str):
                     rule_fn = get_rule(rule)
-                else:
+                elif isinstance(rule, tuple) and callable(rule[0]):
+                    rule_fn, message = rule
+                elif callable(rule):
                     rule_fn = rule
 
                 if not rule_fn:
                     continue
 
                 try:
-                    err = rule_fn(field, value, data) if rule_fn.__code__.co_argcount == 3 else rule_fn(field, value)
-                    if err:
-                        errors.setdefault(field, []).append(err)
-                except Exception as e:
-                    errors.setdefault(field, []).append(f"{field}: validation error")
+                    # Pass correct arg count
+                    if rule_fn.__code__.co_argcount == 3:
+                        valid = rule_fn(field, value, data)
+                    elif rule_fn.__code__.co_argcount == 2:
+                        valid = rule_fn(field, value)
+                    else:
+                        valid = rule_fn(value)
+
+                    # If validation failed
+                    if not valid:
+                        errors.setdefault(field, []).append(
+                            message or f"{field} is invalid"
+                        )
+
+                except Exception:
+                    errors.setdefault(field, []).append(
+                        message or f"{field}: validation error"
+                    )
+
         return errors
 
     def bind_to(self, cls, defaults: dict = {}, cast: bool = True):

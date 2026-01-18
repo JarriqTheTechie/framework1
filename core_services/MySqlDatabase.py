@@ -57,6 +57,13 @@ class MySqlDatabase(Database):
     def pquery(self, queries, *args):
         # Convert args to list if it's not already
         args_list = list(args)
+
+        # if queries is a dictionary convert to list of dictionaries with multiple keys then turn into a list of dictionaries
+        if isinstance(queries, dict):
+            queries = [{k: v} for k, v in queries.items()]
+            #raise Exception(queries)
+
+
         keys = []
         for key in queries:
             keys.append(list(key.keys())[0])
@@ -79,13 +86,19 @@ class MySqlDatabase(Database):
 
         # Build final SQL batch
         final_query = "; ".join(queries)
+
+
         # self.logger.info(f"PQUERY [PRE-EXECUTION] {final_query}")
 
         with self.connect() as cur:
             start_time = time.perf_counter()
-            cur.execute(final_query, tuple(args_list))
+            try:
+                cur.execute(final_query, tuple(args_list))
+            except mysql.connector.errors.ProgrammingError as e:
+                self.logger.error(final_query)
+                raise
             elapsed_ms = (time.perf_counter() - start_time) * 1000
-            self._log_query(final_query, args_list, elapsed_ms)
+            self._log_query(final_query, args_list, elapsed_ms, event_name="sql_pquery")
 
             all_results = []
             resultset = cur.fetchall()

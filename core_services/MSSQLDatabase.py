@@ -45,20 +45,24 @@ class MSSQLDatabase(Database):
     def query(self, query_str: str | QueryBuilder, *args: tuple) -> list[dict[str, Any]]:
         if not isinstance(query_str, str):
             query_str, args = query_str.get()
+
         query_str = query_str.replace("%s", "?")
+        print(query_str)
         start_time = time.perf_counter()
-        print(query_str, *args)
         self.connect().execute(query_str, *args)
+
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         if len(args) == 0:
             debug_view_args = None
         else:
             debug_view_args = args[0]
-        print(query_str)
         self._log_query(query_str, params=debug_view_args, elapsed_ms=elapsed_ms)
-        columns = get_column_names(self.cursor)  # Get column names
-        raw_results = self.cursor.fetchall()
-        self.results = result_to_dotdict(columns, raw_results, self.DotDict)
+        try:
+            columns = get_column_names(self.cursor)  # Get column names
+            raw_results = self.cursor.fetchall()
+            self.results = result_to_dotdict(columns, raw_results, self.DotDict)
+        except TypeError:
+            self.results = []
         return self.results
 
     def pquery(self, queries, *args):
@@ -82,16 +86,18 @@ class MSSQLDatabase(Database):
 
         start_time = time.perf_counter()
 
-
         # Execute the batch query
         cursor = self.connect()
         if args:
             results = cursor.execute(joined, *args)
         else:
-            results = cursor.execute(joined)
+            if joined:
+                results = cursor.execute(joined)
+            else:
+                return ([])
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000
-        self._log_query(joined, params=args if args else (), elapsed_ms=elapsed_ms)
+        self._log_query(joined, params=args if args else (), elapsed_ms=elapsed_ms, event_name="sql_pquery")
 
         # Get first result set
         first_resultset = cursor.fetchall()

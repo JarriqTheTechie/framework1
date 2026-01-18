@@ -1,10 +1,13 @@
 import pprint
+from _collections_abc import Iterable
 
+from framework1.core_services.MSSQLDatabase import result_to_dotdict, get_column_names
 import inflect
 import re
 from copy import deepcopy
 from datetime import datetime
 from framework1.core_services.Database import Database
+from framework1.database.BulkPreloader import BulkPreloader
 from framework1.database.Events import Events
 from framework1.database.active_record.utils.ModelCollection import ModelCollection
 from framework1.database.fields.Fields import Field
@@ -16,13 +19,58 @@ from dotenv import load_dotenv
 import inspect
 from framework1.ddd.ValueObject import ValueObject
 from operator import itemgetter
+from logly import logger
 
 load_dotenv()
 p = inflect.engine()
+T = TypeVar("T", bound="ActiveRecord")
 
 from framework1.database.QueryBuilder import QueryBuilder
 
 from datetime import datetime, date
+
+
+class dualmethod:
+    def __init__(self, func: Callable[..., Any]):
+        self.func = func
+
+    def __get__(self, obj: Any, cls: Type[T]):
+        """
+        Handles:
+            - class-bound call → clone class → call method
+            - instance-bound call → call method normally
+        """
+        if obj is None:
+            # Called from CLASS
+            def wrapper(*args, **kwargs):
+                # Auto-clone class before method runs
+                new_cls = type(cls.__name__, cls.__bases__, dict(cls.__dict__))
+                # Pass cloned class as first argument
+                return self.func(new_cls, *args, **kwargs)
+
+            return wrapper
+
+        else:
+            # Called from INSTANCE
+            def wrapper(*args, **kwargs):
+                return self.func(obj, *args, **kwargs)
+
+            return wrapper
+
+
+def get_model_fields(model_or_class):
+    """
+    Returns a dict of {field_name: FieldInstance} for all declared Field attributes.
+    Works with both class and instance objects.
+    """
+    cls = model_or_class if isinstance(model_or_class, type) else model_or_class.__class__
+
+    fields = {}
+    for name, value in vars(cls).items():
+        if isinstance(value, Field):
+            fields[name] = value
+    return fields
+
 
 def normalize_values(record: dict[str, Any]) -> dict[str, Any]:
     out = {}
@@ -37,12 +85,14 @@ def normalize_values(record: dict[str, Any]) -> dict[str, Any]:
         out[k] = v
     return out
 
+
 def dto(mapping: dict[str, str]):
     """
     Decorator for DTO mappers.
     - Auto maps fields from __data__ and relationships.
     - If DTO has ValueObject fields, wraps them automatically.
     """
+
     def decorator(fn):
         fn.__dto_mapping__ = mapping
         fn.__is_dto_mapper__ = True
@@ -75,7 +125,7 @@ def dto(mapping: dict[str, str]):
                     mapped[dto_field] = None
 
             # --- AUTO-WRAP VALUE OBJECTS ---
-            dto_cls = fn.__annotations__.get("return")   # get DTO class
+            dto_cls = fn.__annotations__.get("return")  # get DTO class
             if dto_cls:
                 hints = getattr(dto_cls, "__annotations__", {})
                 for field, hint in hints.items():
@@ -86,9 +136,8 @@ def dto(mapping: dict[str, str]):
             return fn(mapped, *args, **kwargs)
 
         return wrapper
+
     return decorator
-
-
 
 
 def parse_withs(withs: list[str]) -> dict:
@@ -108,6 +157,7 @@ def parse_withs(withs: list[str]) -> dict:
             node = node.setdefault(p, {})
     return tree
 
+
 def expand_withs(withs: list[str]) -> list[str]:
     expanded = set(withs)
     for w in withs:
@@ -115,36 +165,6 @@ def expand_withs(withs: list[str]) -> list[str]:
         for i in range(1, len(parts)):
             expanded.add(".".join(parts[:i]))
     return list(expanded)
-
-def get_relationship_type(fn) -> str:
-    if (getattr(fn, "__has_one__", False)
-            or getattr(fn, "__belongs_to__", False)
-            or getattr(fn, "__has_one_through__", False)):
-        return "one"
-    else:
-        return "many"
-
-
-def remove_first_condition(query_obj: QueryBuilder, clone: bool = True) -> QueryBuilder:
-    """
-    Safely remove the first WHERE condition and its bound parameter.
-
-    Args:
-        query_obj: The query builder or ActiveRecord instance.
-        clone: If True, returns a cloned copy; if False, mutates in place.
-
-    Returns:
-        QueryBuilder with first condition + parameter removed.
-    """
-    target = deepcopy(query_obj) if clone else query_obj
-
-    if getattr(target, "conditions", None):
-        target.conditions = target.conditions[1:]
-
-    if getattr(target, "parameters", None):
-        target.parameters = target.parameters[1:]
-
-    return target
 
 
 class Relationship:
@@ -155,198 +175,14 @@ class Relationship:
         ...
 
 
-def bulk_preload_withs(models: "ModelCollection", instance: Optional[Type[Self]] = None):
-    from framework1.database.active_record.utils.ModelCollection import ModelCollection
-    """
-    Bulk preloads __with__ relationships for a collection of models.
-    Supports nested relationships like __with__ = ["client.alerts"].
-    Requires relationship functions to define both foreign_key and owner_key.
-    """
-    if not models:
-        return
-
-    primary_model = models[0]
-
-    # 👇 choose source of withs
-    if instance is None:
-        if getattr(primary_model, "_with_overrides", None) is not None:
-            withs = primary_model._with_overrides
-        else:
-            withs = getattr(primary_model, "__with__", [])
-    else:
-        if getattr(instance, "_with_overrides", None) is not None:
-            withs = instance._with_overrides
-        else:
-            withs = getattr(instance, "__with__", [])
-    if not withs:
-        return
-
-
-    # Build tree so we know nested structure
-    with_tree = parse_withs(withs)
-
-    queries_for_pquery = []
-    params_for_pquery = []
-    join_meta = []
-
-    # --- Build queries for top-level only ---
-    for relationship, nested in with_tree.items():
-        relationship_query = getattr(primary_model, relationship)()
-        database = getattr(relationship_query, "db")
-
-
-        rel_cls = relationship_query.__class__
-
-        # Detect relationship type
-        rel_type = get_relationship_type(relationship_query)
-
-        fk_field = getattr(relationship_query, "__foreign_key__", None)
-        owner_field = getattr(relationship_query, "__owner_key__", None)
-
-        if not getattr(relationship_query, '__match_fn__', None) and not getattr(relationship_query, '__constraints__', None):
-            if not fk_field or not owner_field:
-                raise Exception(
-                    f"Relationship '{relationship}' did not define foreign_key/owner_key properly"
-                )
-
-        if rel_type == "many":
-            # collect parent.owner_key values
-            if getattr(relationship_query, "__constraints__", None):
-                bulk_query = getattr(relationship_query, "__constraints__")
-            else:
-                ids = [m.__data__.get(owner_field) for m in models if m.__data__.get(owner_field)]
-                bulk_query = (
-                    remove_first_condition(relationship_query).where_in(fk_field, ids)
-                )
-        else:
-            # belongs_to / has_one: collect parent.foreign_key values
-            parent_fk_values = [
-                getattr(m, fk_field)
-                for m in models
-                if getattr(m, fk_field, None)
-            ]
-            #raise Exception(relationship_query.__dict__)
-            bulk_query = (
-                remove_first_condition(relationship_query)
-                .where_in(owner_field, parent_fk_values)
-            )
-
-
-
-        queries_for_pquery.append({
-            relationship: bulk_query.to_sql(),
-            "db": database.__class__.__name__,
-            "params": bulk_query.parameters,
-            'db_instance': database
-        })
-        #params_for_pquery.extend()
-        join_meta.append({
-            "rel": relationship,
-            "fk_field": fk_field,
-            "rel_type": rel_type,
-            "rel_cls": rel_cls,
-            "nested_withs": nested,
-            "foreign_key": fk_field,
-            "owner_key": owner_field,
-            "match_fn": getattr(relationship_query, '__match_fn__', None),
-            "constraints": getattr(relationship_query, '__constraints__', None)
-        })
-
-    if not queries_for_pquery:
-        return
-
-    pquery_results = []
-    databases = ModelCollection(list(set([key['db'] for key in queries_for_pquery])))
-    queries_for_pquery = ModelCollection(queries_for_pquery)
-    for db in databases:
-        db_instance = queries_for_pquery.where(lambda q: q['db'] == db).first()['db_instance']
-        queries_for_this_db = []
-        params_for_this_db = []
-        for q in queries_for_pquery.where(lambda q: q['db'] == db):
-            q = deepcopy(q)
-            params = q['params']
-            q.pop('db')
-            q.pop('db_instance')
-            q.pop('params')
-            queries_for_this_db.append(q)
-            params_for_this_db.extend(params)
-
-        results_from_this_db = db_instance.pquery(queries_for_this_db, *params_for_this_db)
-        pquery_results.append(results_from_this_db)
-
-
-
-    pquery_results = [item for sublist in pquery_results for item in sublist]
-
-
-    # Map results
-    rel_results_by_name = {}
-    for res in pquery_results:
-        for key, rows in res.items():
-            rel_results_by_name[key] = [dict(r) for r in rows]
-
-
-    # Assign hydrated results
-    for model in models:
-        for meta in join_meta:
-            rel_name = meta["rel"]
-            fk_field = meta["fk_field"]
-            rel_type = meta["rel_type"]
-            rel_cls = meta["rel_cls"]
-            nested_withs = meta["nested_withs"]
-            owner_field = meta["owner_key"]
-            match_fn = meta["match_fn"]
-            constraints = meta["constraints"]
-
-            if rel_name not in rel_results_by_name or not rel_cls:
-                setattr(model, f"_{rel_name}_cache", None if rel_type == "one" else [])
-                continue
-
-            raw_rows = rel_results_by_name[rel_name]
-            if not match_fn and not constraints:
-                hydrated = rel_cls()._hydrate_results(raw_rows) if raw_rows else []
-            else:
-                hydrated = raw_rows
-
-            if rel_type == "many":
-                if not match_fn and not constraints:
-                    pk_val = model.__data__.get(owner_field)
-                    related = [r for r in hydrated if r.__data__.get(fk_field) == pk_val]
-                    setattr(model, f"_{rel_name}_cache", related)
-                else:
-                    related = getattr(relationship_query, '__match_fn__', None)(hydrated)
-                    setattr(model, f"_{rel_name}_cache", related)
-
-                if nested_withs and related:
-                    for r in related:
-                        r.__with__ = [
-                            f"{k}" if not v else f"{k}.{'.'.join(v.keys())}"
-                            for k, v in nested_withs.items()
-                        ]
-                    bulk_preload_withs(ModelCollection(related))
-
-            else:  # one
-                parent_fk_val = getattr(model, fk_field, None)
-                related = next(
-                    (r for r in hydrated if getattr(r, owner_field) == parent_fk_val),
-                    None
-                )
-                setattr(model, f"_{rel_name}_cache", related)
-
-                if nested_withs and related:
-                    related.__with__ = [
-                        f"{k}" if not v else f"{k}.{'.'.join(v.keys())}"
-                        for k, v in nested_withs.items()
-                    ]
-                    bulk_preload_withs(ModelCollection([related]))
-
-
-def mark_relationship(query, rel_type: str, owner_key: str = None, foreign_key: str = None) -> QueryBuilder:
+def mark_relationship(query, rel_type: str, owner_key: str = None, foreign_key: str = None,
+                      foriegn_key_alias: str = None, local_key_alias: str = None):
     query.__is_relationship__ = True
     setattr(query, f"__{rel_type}__", True)
     query.__owner_key__ = owner_key
     query.__foreign_key__ = foreign_key
-
+    query.__foreign_key_alias__ = foriegn_key_alias
+    query.__owner_key_alias__ = local_key_alias
     return query
 
 
@@ -378,12 +214,14 @@ def transform_word(raw_word: str):
         "snake_plural": to_snake_case(plural_spaced),  # destruction_logs
     }
 
+
 def replace_select_fields(sql: str, new_fields: str) -> str:
     """
     Replace only the first occurrence of text between SELECT and FROM with a given string.
     """
     pattern = r"(?i)(SELECT\s+)(.*?)(\s+FROM\s+)"
     return re.sub(pattern, rf"\1{new_fields}\3", sql, count=1, flags=re.DOTALL)
+
 
 class PaginationResult:
     def __init__(self, items, total, per_page, current_page):
@@ -411,9 +249,6 @@ class PaginationResult:
         }
 
 
-T = TypeVar("T", bound="ActiveRecord")
-
-
 class ActiveRecordMeta(type):
     def __init__(cls, name, bases, attrs):
         super().__init__(name, bases, attrs)
@@ -436,6 +271,7 @@ class ActiveRecord(QueryBuilder, Events,
     __database__: Type[Database] = Database
     __abstract__: bool = True
     __appends__: list[str] = []
+    __timestamps_disabled__: bool = False
 
     # ---------------------------------------------------------------------------
     # Class-level properties
@@ -460,6 +296,14 @@ class ActiveRecord(QueryBuilder, Events,
         self.gather_scopes()
         self._with_events = False
 
+        self.__timestamps_override__ = getattr(self, "__timestamps_override__", {
+            "created_at": "created_at",
+            "updated_at": "updated_at",
+            "deleted_at": "deleted_at"
+        })
+
+        self.__timestamps_disabled__ = getattr(self, "__timestamps_disabled__", False)
+
         self.fill(**kwargs)
 
     def get_appends(self):
@@ -467,6 +311,14 @@ class ActiveRecord(QueryBuilder, Events,
         Returns the list of appended fields.
         """
         return self.__appends__
+
+    @dualmethod
+    def without_appends(self_or_cls: Self | Type[Self], appends: list[str] = None):
+        if appends is None:
+            appends = []
+
+        self_or_cls.__appends__ = appends
+        return self_or_cls
 
     def __getattribute__(self, key) -> Any:
         """
@@ -589,7 +441,6 @@ class ActiveRecord(QueryBuilder, Events,
         parent_primary_key = self.get_primary_key_column()
         local_key = local_key or parent_primary_key
 
-
         # Related model instance + table
         related_model = model()
         related_table = model.__table__
@@ -604,9 +455,38 @@ class ActiveRecord(QueryBuilder, Events,
         )
         return mark_relationship(query, "has_one", foreign_key=foreign_key, owner_key=local_key)
 
+    def has_one_through(
+            self,
+            through,
+            model,
+            first_key: str,
+            second_key: str,
+            through_owner_key: str = None,
+            target_owner_key: str = None,
+    ):
+        """
+        Preloadable has_one_through relationship, via multi-step resolution.
+        """
+        query = model().new_query()
+        query.__has_one_through__ = True
+        query.__through__ = through
+        query.__first_key__ = first_key
+        query.__second_key__ = second_key
+        query.__through_owner_key__ = through_owner_key or through().get_primary_key_column()
+        query.__target_owner_key__ = target_owner_key or model().get_primary_key_column()
+
+        return mark_relationship(query, "one", owner_key=query.__first_key__, foreign_key=query.__second_key__)
+
     def belongs_to(self, model, foreign_key: str = None, owner_key: str = None):
         related_model = model()
         related_table = model.__table__
+        if not foreign_key and not owner_key:
+            if hasattr(related_model, "__primary_key__"):
+                foreign_key = related_model.__primary_key__
+                owner_key = related_model.__primary_key__
+            else:
+                raise Exception(
+                    f"Either foreign_key or owner_key must be provided for belongs_to relationship in {self.__class__.__name__}")
 
         # Guess foreign key if not provided
         if not foreign_key:
@@ -623,7 +503,8 @@ class ActiveRecord(QueryBuilder, Events,
 
         return mark_relationship(query, "belongs_to", foreign_key=foreign_key, owner_key=owner_key)
 
-    def has_many(self, model, foreign_key: str = None, local_key: str = None):
+    def has_many(self, model, foreign_key: str = None, local_key: str = None, foriegn_key_alias: str = None,
+                 local_key_alias: str = None) -> Self:
         from framework1.cli.resource_handler import transform_word
 
         parent_primary_key = self.get_primary_key_column()
@@ -639,7 +520,9 @@ class ActiveRecord(QueryBuilder, Events,
             f"{related_table}.{foreign_key}",
             getattr(self, local_key)
         )
-        return mark_relationship(query, "has_many", owner_key=local_key, foreign_key=foreign_key)
+
+        return mark_relationship(query, "has_many", owner_key=local_key, foreign_key=foreign_key,
+                                 foriegn_key_alias=foriegn_key_alias, local_key_alias=local_key_alias)
 
     def hybrid_many_relationship(self, query: Relationship) -> QueryBuilder:
         """
@@ -655,7 +538,6 @@ class ActiveRecord(QueryBuilder, Events,
         query.__match_fn__ = getattr(query, "match")
         return query
 
-
     def with_(self, withs: list[str]) -> "Self":
         """
         Merge additional relationships with defaults for this instance only.
@@ -664,14 +546,21 @@ class ActiveRecord(QueryBuilder, Events,
         self._with_overrides = expand_withs(base + withs)
         return self
 
-    def with_only(self, withs: list[str]) -> "Self":
+    # def with_only(self, withs: list[str]) -> "Self":
+    #     """
+    #     Replace relationships entirely for this instance only.
+    #     """
+    #     self._with_overrides = expand_withs(withs)
+    #     return self
+    @classmethod
+    def with_only(cls, withs: list[str]) -> "Self":
         """
         Replace relationships entirely for this instance only.
         """
-        self._with_overrides = expand_withs(withs)
-        return self
-
-
+        new_class = cls
+        new_class._with_overrides = withs
+        new_class.__with__ = []
+        return new_class
 
     # ---------------------------------------------------------------------------
     # Debugging and introspection
@@ -734,6 +623,7 @@ class ActiveRecord(QueryBuilder, Events,
     def get_table(self) -> str:
         return getattr(self, "__table__", "")
 
+    @dualmethod
     def get_primary_key_column(self) -> str:
         return getattr(self, "__primary_key__")
 
@@ -876,9 +766,21 @@ class ActiveRecord(QueryBuilder, Events,
 
         columns = []
         pk = None
+        driver = getattr(cls, "__driver__", "mysql").lower()
 
         for name, field in fields.items():
-            col_def = f"`{name}` {field.get_sql_type()}"
+            # Use correct identifier quoting per driver
+            if driver == "mssql":
+                col_def = f"[{name}] {field.get_sql_type()}"
+            else:
+                col_def = f"`{name}` {field.get_sql_type()}"
+
+            # MSSQL: IDENTITY(1,1) instead of AUTO_INCREMENT
+            if getattr(field, "auto_increment", False):
+                if driver == "mssql":
+                    col_def += " IDENTITY(1,1)"
+                else:
+                    col_def += " AUTO_INCREMENT"
 
             if field.collation:
                 col_def += f" COLLATE {field.collation}"
@@ -886,31 +788,59 @@ class ActiveRecord(QueryBuilder, Events,
                 col_def += " NOT NULL"
             if field.unique:
                 col_def += " UNIQUE"
+
+            # Default handling per driver
             if field.default is not None:
-                if isinstance(field.default, str) and field.default.upper() in ("CURRENT_TIMESTAMP", "NOW()"):
-                    col_def += f" DEFAULT {field.default}"
+                if isinstance(field.default, str):
+                    default_upper = field.default.upper()
+                    if default_upper in ("CURRENT_TIMESTAMP", "NOW()", "GETDATE()"):
+                        col_def += f" DEFAULT {field.default}"
+                    else:
+                        col_def += f" DEFAULT '{field.default}'"
                 elif isinstance(field.default, (int, float)):
                     col_def += f" DEFAULT {field.default}"
-                else:
-                    col_def += f" DEFAULT '{field.default}'"
+
+            # Comments (MySQL supports COMMENT, MSSQL just ignore/comment out)
             if field.comment:
-                col_def += f" COMMENT '{field.comment}'"
+                if driver == "mysql":
+                    col_def += f" COMMENT '{field.comment}'"
+                else:
+                    col_def += f" -- {field.comment}"
 
             if field.primary_key:
                 pk = name
 
             columns.append(col_def)
 
+        # Add primary key constraint
         if pk:
-            columns.append(f"PRIMARY KEY (`{pk}`)")
+            if driver == "mssql":
+                columns.append(f"CONSTRAINT PK_{cls.__table__}_{pk} PRIMARY KEY ([{pk}])")
+            else:
+                columns.append(f"PRIMARY KEY (`{pk}`)")
 
         table_name = getattr(cls, "__table__", cls.__name__)
-        return f"CREATE TABLE IF NOT EXISTS `{table_name}` (\n  " + ",\n  ".join(columns) + "\n);"
+
+        # MySQL syntax
+        if driver == "mysql":
+            return f"CREATE TABLE IF NOT EXISTS `{table_name}` (\n  " + ",\n  ".join(columns) + "\n);"
+
+        # MSSQL syntax
+        elif driver == "mssql":
+            return (
+                    f"IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='{table_name}' AND xtype='U')\n"
+                    f"BEGIN\n"
+                    f"CREATE TABLE [{table_name}] (\n  " + ",\n  ".join(columns) + "\n);\nEND;"
+            )
+
+        else:
+            raise ValueError(f"Unsupported driver '{driver}' for schema generation.")
 
     @classmethod
     def create_table(cls) -> None:
         sql = cls.generate_schema()
         db = cls.__database__()
+        logger.debug(sql)
         db.query(sql)
         db.connection.commit()
         print(f"✔ Table `{cls.__table__}` created.")
@@ -929,59 +859,55 @@ class ActiveRecord(QueryBuilder, Events,
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
 
-
     # --------------------------------------------------------------------------
     # Serialization
     # --------------------------------------------------------------------------
 
     def to_dict(self, instance=None) -> DataKlass:
         from framework1.database.ActiveRecord import ActiveRecord
+
         data = {}
+        field_names = list(get_model_fields(self).keys())
 
         # Serialize stored DB fields
         for key, value in self.__data__.items():
+            # if key not in field_names:
+            #     continue
+
             if isinstance(value, datetime):
                 data[key] = value.isoformat()
             elif isinstance(value, bytes):
                 import base64
                 data[key] = base64.b64encode(value).decode("utf-8")
-            elif isinstance(value, ActiveRecord):
-                data[key] = value.to_dict()
-            elif isinstance(value, list) and all(isinstance(x, ActiveRecord) for x in value):
-                data[key] = [x.to_dict() for x in value]
             else:
                 data[key] = value
 
         model = instance or self
 
-        # --- Handle appended/computed attributes ---
+        # --- 1. Inject preloaded relationships into attribute space --- #
+        preload_names = getattr(model, "_with_overrides", getattr(model, "__with__", []))
+        for name in preload_names:
+            cache_attr = f"_{name}_cache"
+            if hasattr(self, cache_attr):
+                cached = getattr(self, cache_attr)
+
+                # Temporarily bind relationship to attribute (so accessors can work)
+                setattr(self, name, cached)
+
+                # Also serialize it for the output
+                if isinstance(cached, ActiveRecord):
+                    data[name] = cached.to_dict()
+                elif isinstance(cached, list):
+                    data[name] = [c.to_dict() if isinstance(c, ActiveRecord) else c for c in cached]
+                else:
+                    data[name] = cached or None
+
+        # --- 2. Append computed attributes --- #
         for field in model.get_appends():
             accessor_name = f"get_{field}_attribute"
             if hasattr(model, accessor_name) and callable(getattr(model, accessor_name)):
                 data[field] = getattr(model, accessor_name)()
 
-        # Serialize preloaded relationships
-        if hasattr(model, "_with_overrides") or hasattr(model, "__with__"):
-            for name in getattr(model, "_with_overrides", getattr(model, "__with__")):
-                cache_attr = f"_{name}_cache"
-                if hasattr(self, cache_attr):
-                    cached = getattr(self, cache_attr)
-                    if isinstance(cached, ActiveRecord):
-                        data[name] = cached.to_dict()
-                    elif isinstance(cached, list):
-                        if len(cached) != 0:
-                            if isinstance(cached[0], ActiveRecord):
-                                data[name] = [c.to_dict() for c in cached]
-                            elif isinstance(cached[0], dict):
-                                data[name] = cached
-                            elif isinstance(cached[0], ModelCollection):
-                                data[name] = cached
-                        else:
-                            data[name] = []
-
-                    else:
-                        # Unexpected preload type → fallback to None
-                        data[name] = None
         return DataKlass(data)
 
     # --------------------------------------------------------------------------
@@ -995,7 +921,7 @@ class ActiveRecord(QueryBuilder, Events,
         results = []
         for row in rows:
             instance = cls(**row)
-            #fire_event(event, instance)
+            fire_event(event, instance)
             results.append(instance)
         return results
 
@@ -1009,7 +935,7 @@ class ActiveRecord(QueryBuilder, Events,
 
         # ✅ preload relationships for .all() as well
         if getattr(self, "__with__", []) or getattr(self, "_with_overrides", None):
-            bulk_preload_withs(collection, instance=self)
+            BulkPreloader(collection, instance=self).run()
 
         return collection
 
@@ -1037,13 +963,33 @@ class ActiveRecord(QueryBuilder, Events,
 
         # ✅ preload relationships, but keep models
         if getattr(self, "__with__", []) or getattr(self, "_with_overrides", None):
-            bulk_preload_withs(collection, instance=self)
+            BulkPreloader(collection, instance=self).run()
 
         self._find_called()
         record = collection[0]
         setattr(record, "conditions", self.conditions)
         setattr(record, "parameters", self.parameters)
         return record
+
+    def find_or_fail(self, id: int, throw=None) -> T:
+        class RecordNotFound:
+            pass
+
+        if not throw:
+            throw = RecordNotFound
+
+        record = self.find(id)
+        if not record:
+            raise throw(f"Record with ID {id} not found.")
+        return record
+
+    def find_or_404(self, id: int) -> T:
+        class HttpNotFoundError(Exception):
+            pass
+
+        return self.find_or_fail(id, throw=HttpNotFoundError)
+
+
 
     def _find_called(self):
         """
@@ -1125,18 +1071,26 @@ class ActiveRecord(QueryBuilder, Events,
 
     def first(self: T, n: int = 1) -> T | List[T] | None:
         """
-        Get the first n records ordered by primary key.
+        Get the first n records ordered by primary key, with relationship preloading like `find`.
         """
         self.order_by(self.__primary_key__, "asc").limit(n)
         rows = self.db.query(*self.get())
         if not rows:
             return None
 
+        # Hydrate into models
+        collection = ModelCollection(self._hydrate_results(rows))
+
+        # ✅ preload relationships (consistent with `find`)
+        if getattr(self, "__with__", []) or getattr(self, "_with_overrides", None):
+            BulkPreloader(collection, instance=self).run()
+
         results = []
-        for row in rows:
-            instance = self.__class__(**row)
-            self.fire_event("retrieved", instance)
-            results.append(instance)
+        for record in collection:
+            self.fire_event("retrieved", record)
+            setattr(record, "conditions", self.conditions)
+            setattr(record, "parameters", self.parameters)
+            results.append(record)
 
         return results[0] if n == 1 else results
 
@@ -1149,11 +1103,15 @@ class ActiveRecord(QueryBuilder, Events,
             raise RecordNotFound
         return result
 
+    @dualmethod
     def last(self: T, n: int = 1) -> T | List[T] | None:
         """
         Get the last n records ordered by primary key.
         """
-        self.order_by(self.get_primary_key_column(), "DESC").limit(n)
+        if isinstance(self, type):
+            return self.order_by(self.get_primary_key_column(), "DESC").limit(n)
+        else:
+            self.order_by(self.get_primary_key_column(), "DESC").limit(n)
         rows = self.db.query(*self.get())
         if not rows:
             return None
@@ -1178,14 +1136,13 @@ class ActiveRecord(QueryBuilder, Events,
     # --------------------------------------------------------------------------
     # Aggregates & Pagination
     # --------------------------------------------------------------------------
-
-    def count(self):
-        self.select("COUNT(*) as count")
-        return self.all()[0].to_dict().get("count")
+    def count(self, column: str = "*", alias: str = "aggregate") -> ModelCollection:
+        self.as_count(column, alias)
+        rows = self.db.query(self)
+        return ModelCollection(rows).first()[alias]
 
     def paginate(self: T, page: int = 1, per_page: int = 10) -> PaginationResult:
         from framework1.database.active_record.utils.ModelCollection import ModelCollection
-        from framework1.database.ActiveRecord import bulk_preload_withs
 
         """
         Paginate results with database-level pagination.
@@ -1214,7 +1171,7 @@ class ActiveRecord(QueryBuilder, Events,
 
         # Hydrate rows and fire events
         items = ModelCollection(self._hydrate_results(rows))
-        bulk_preload_withs(items)
+        BulkPreloader(items).run()
 
         return PaginationResult(
             items=items,
@@ -1239,7 +1196,7 @@ class ActiveRecord(QueryBuilder, Events,
         instance.fire_event("creating", instance)
         instance.fire_event("saving", instance)
 
-        instance.save()
+        instance.save(is_from_create=True)
 
         # Fire lifecycle events after save
         instance.fire_event("created", instance)
@@ -1248,55 +1205,108 @@ class ActiveRecord(QueryBuilder, Events,
 
         return instance
 
-    def save(self) -> Any:
+    def save(self, has_triggers=False, is_from_create=False) -> Any:
         """
         Insert or update the current model instance in the database.
         Handles lifecycle events before/after persistence.
         """
         now = datetime.utcnow().isoformat()
         pk = self.get_primary_key_column()
-        data = self.__data__
+        record_pk = self.__data__.get(pk)
+        self.original = self.__data__
 
-        if pk in data:
-            # Update path
-            if data == self.__original__:
-                return data[pk]
+        fields = self.get_fields()
+        # Track differences
+        changed_fields = {}
+        for k, v in self.__data__.items():
+            original_val = self.__original__.get(k) if hasattr(self, "__original__") else None
+            if v != original_val:
+                changed_fields[k] = v
+
+        # Drop None and unknown fields
+        data = {k: v for k, v in self.__data__.items() if k in fields and v is not None}
+
+        # ---------------------
+        # UPDATE PATH
+        # ---------------------
+        if not is_from_create and record_pk:
+            # No actual changes
+            if not changed_fields:
+                return record_pk
 
             # Fire before update
             self.fire_event("updating", self)
             self.fire_event("saving", self)
 
-            data.setdefault("updated_at", now)
-            q = self.where(pk, "=", data[pk]).update(data)
-            result = self.db.query(*q)
+            # Set timestamp
+
+            if not getattr(self, "__timestamps_disabled__", False):
+                updated_field = self.__timestamps_override__.get("updated_at")
+                if updated_field and hasattr(self, updated_field):
+                    changed_fields[updated_field] = now
+
+            # Remove primary key from update values
+            update_values = {k: v for k, v in changed_fields.items() if k != pk}
+
+            if not update_values:
+                return record_pk
+
+            # Build SQL
+            builder = QueryBuilder().table(self.__class__.__table__) \
+                .where(self.get_primary_key_column(), "=", record_pk)
+
+            sql, params = builder.update(update_values)
+
+            print(sql, params)
+
+            # Ensure parameters are in proper order
+            params = list(update_values.values()) + [record_pk]
+
+            # Execute the update
+            self.db.query(sql, params)
             self.db.connection.commit()
 
             # Fire after update
             self.fire_event("updated", self)
             self.fire_event("saved", self)
             self.__original__ = self.__data__.copy()
-            return data[pk]
+
+            return data.get(pk, record_pk)  # return primary key field value
 
         else:
             # Insert path
-            if hasattr(self, "created_at"):
-                data.setdefault("created_at", now)
-            if hasattr(self, "updated_at"):
-                data.setdefault("updated_at", now)
+            if not getattr(self, "__timestamps_disabled__", False):
+                if hasattr(self, self.__timestamps_override__.get("created_at")):
+                    data.setdefault(self.__timestamps_override__.get("created_at"), now)
+                if hasattr(self, self.__timestamps_override__.get("updated_at")):
+                    data.setdefault(self.__timestamps_override__.get("updated_at"), now)
 
             # Fire events only if not created via .create()
             if not getattr(self, "_created_by_create", False):
                 self.fire_event("creating", self)
                 self.fire_event("saving", self)
 
-            q = self.insert(data)
+            q = self.insert(data, has_triggers=has_triggers)
             with self.db.connect() as cursor:
+                print(f"Inserting with query: {q}")
                 cursor.execute(*q)
-                if self.__class__.__driver__ != "mssql":
+                if self.__driver__ == "mysql":
                     last_id = cursor.lastrowid
-                else:
-                    cursor.execute("SELECT SCOPE_IDENTITY()")
-                    last_id = cursor.fetchone()[0]
+                    cursor.execute(f"SELECT * FROM {self.__table__} WHERE {self.get_primary_key_column()} = %s",
+                                   (last_id,))
+                    row = cursor.fetchone()
+                elif self.__driver__ == "mssql":
+                    if not has_triggers:
+                        columns = get_column_names(cursor)  # Get column names
+                        row = result_to_dotdict(columns, [cursor.fetchone()], DataKlass)
+                        last_id = row[0].get(self.get_primary_key_column())
+                    else:
+                        cursor.execute("SELECT SCOPE_IDENTITY() AS last_id")
+                        last_id = cursor.fetchone().last_id
+                        cursor.execute(f"SELECT * FROM {self.__table__} WHERE {self.get_primary_key_column()} = ?",
+                                       (last_id,))
+                        row = cursor.fetchone()
+
                 self.db.connection.commit()
 
                 if last_id:
@@ -1407,21 +1417,29 @@ class ActiveRecord(QueryBuilder, Events,
         if is_instance:
             # Instance update path
             for key, value in values.items():
+                print(key, value)
                 self.__data__[key] = value
 
             self.fire_event("updating", self)
             self.fire_event("saving", self)
 
             sql, params = super().update(values)
+
+            if "processed_count" in sql:
+                print(f"{sql} with args {params}")
+
             if isinstance(params, list):
-                params = [p for p in params if p != 1]
+                # params = [p for p in params if p != 1]
+                pass
 
             self.db.query(sql, params)
             self.db.connection.commit()
 
             self.fire_event("updated", self)
             self.fire_event("saved", self)
-            return True
+
+            primary_key = getattr(self, self.get_primary_key_column())
+            return self.clone_without_columns_or_ordering().where(self.get_primary_key_column(), primary_key).first()
 
         # Bulk update with events
         elif self._with_events:
@@ -1526,3 +1544,19 @@ class ActiveRecord(QueryBuilder, Events,
                 if attr_name.endswith(target):
                     return fn()  # 👈 decorator now handles mapping + row
         raise ValueError(f"No DTO mapper found for target '{target}' in {self.__class__.__name__}")
+
+    def run_batch_queries(self, filter_dict: dict[str, QueryBuilder] | dict[str, str]):
+        """
+        Perform batch queries on a model class using the provided filter dictionary.
+        Each key in the filter_dict corresponds to a query to be executed.
+        """
+        results = {}
+        results = self.db.pquery(filter_dict)
+        merged_results = {}
+        for result in results:
+            merged_results.update(
+                DataKlass({
+                    list(result.keys())[0]: DataKlass(result.get(list(result.keys())[0])[0])
+                })
+            )
+        return DataKlass(merged_results)

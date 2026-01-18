@@ -52,6 +52,10 @@ class FieldGroup:
         self._wrapped_div_class_ = class_name
         return self
 
+    def inherit_controller_from(self, parent, field):
+        self._stimulus_controller = getattr(parent, "_stimulus_controller", None)
+        field.inherit_controller_from(self)
+        return self
 
 
     def render(self, data: dict, form) -> str:
@@ -91,8 +95,9 @@ class FieldGroup:
         if self.description:
             group_html += f'<p class="{self.description_class}">{self.description}</p>'
 
-        for field in self.fields:
 
+        for field in self.fields:
+            self.inherit_controller_from(form, field)
             raw_value = resolve_dotted(data, field.name)
             formatted_value = field._format_value(raw_value, data)
             group_html += f'<div class="{self.field_container_class} {field.get_outer_class()}">{field.render_input(formatted_value, data)}{form.render_errors(field.name)}</div>'

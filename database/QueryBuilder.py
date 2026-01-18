@@ -1,5 +1,5 @@
 import pprint
-
+import re
 import sys
 from datetime import date, datetime
 from typing import Any, List, Union, Tuple, Callable
@@ -192,7 +192,9 @@ class QueryBuilder:
         self.parameters.extend(subquery.parameters)
         return self
 
-    def when(self, condition: Any, callback: Callable[['QueryBuilder', Any], Any],
+    def when(self,
+             condition: Any,
+             callback: Callable[['QueryBuilder', Any], Any],
              default: Callable[['QueryBuilder', Any], Any] = None):
         if condition:
             callback(self, condition)
@@ -547,22 +549,24 @@ class QueryBuilder:
         return self
 
     def order_by(self, column, direction="asc"):
+        if column:
+            direction = (direction or "").upper()
+            if direction not in ("ASC", "DESC", ""):
+                raise ValueError("Direction must be 'ASC', 'DESC', or ''")
 
-        direction = (direction or "").upper()
-        if direction not in ("ASC", "DESC", ""):
-            raise ValueError("Direction must be 'ASC', 'DESC', or ''")
+            key = column.expression if isinstance(column, Raw) else str(column)
 
-        key = column.expression if isinstance(column, Raw) else str(column)
-
-        # check only the first element of each tuple
-        for i, (col, _) in enumerate(self.order_by_clauses):
-            if col == key:
-                # update existing entry’s direction
-                self.order_by_clauses[i] = (col, direction)
-                break
+            # check only the first element of each tuple
+            for i, (col, _) in enumerate(self.order_by_clauses):
+                if col == key:
+                    # update existing entry’s direction
+                    self.order_by_clauses[i] = (col, direction)
+                    break
+            else:
+                # not found → add it
+                self.order_by_clauses.append((key, direction))
         else:
-            # not found → add it
-            self.order_by_clauses.append((key, direction))
+            self.remove_ordering()
 
         return self
 
@@ -598,6 +602,54 @@ class QueryBuilder:
         self.rows_fetch = None
         self.limit_count = None
         self.offset_count = None  # Add this line to clear offset
+        return self
+
+    def as_count(self, column: str = "*", alias: str = "aggregate"):
+        """
+        Transform the current query into a COUNT query.
+
+        - Preserves WHERE / JOIN / CTE / UNION logic
+        - Removes ORDER BY, LIMIT, OFFSET
+        - Wraps GROUP BY queries in a subquery
+        - Returns self for chaining
+        """
+
+        # Clear pagination
+        self.limit_count = None
+        self.offset_count = None
+        self.rows_fetch = None
+        self.order_by_clauses = []
+
+        # GROUP BY requires subquery wrapping
+        if self.group_by_columns:
+            sub = self.clone()
+            sub.columns = ["1"]
+            sub.order_by_clauses = []
+            sub.limit_count = None
+            sub.offset_count = None
+            sub.rows_fetch = None
+
+            # Reset this builder into a wrapper query
+            self.columns = [Raw(f"COUNT(*) AS {alias}")]
+            self.joins = []
+            self.conditions = []
+            self.group_by_columns = []
+            self.having_conditions = []
+            self.distinct_flag = False
+            self.unions = []
+            self.ctes = []
+
+            self.__table__ = f"({sub.to_sql()}) AS count_subquery"
+            self.parameters = sub.parameters[:]
+            return self
+
+        # Normal COUNT
+        if self.distinct_flag and column != "*":
+            self.columns = [Raw(f"COUNT(DISTINCT {column}) AS {alias}")]
+        else:
+            self.columns = [Raw(f"COUNT({column}) AS {alias}")]
+
+        self.distinct_flag = False
         return self
 
     def offset(self, count):
@@ -794,7 +846,7 @@ class QueryBuilder:
         self.parameters.extend(query.parameters)
         return self
 
-    def insert(self, data: dict[str, Any]):
+    def insert(self, data: dict[str, Any], has_triggers=False):
         """
         Generates a cross-compatible INSERT INTO SQL statement.
 
@@ -805,12 +857,31 @@ class QueryBuilder:
             raise ValueError("No data provided for insert.")
 
         columns = ", ".join(self._quote_column(col) for col in data.keys())
-        if self.__driver__ == "mssql":
-            placeholders = ", ".join(["?"] * len(data))
-        else:
-            placeholders = ", ".join(["%s"] * len(data))
-        sql = f"INSERT INTO {self.__table__} ({columns}) VALUES ({placeholders})"
-        return sql, list(data.values())
+
+        # Handle Raw() values properly
+        placeholders = []
+        params = []
+
+        for value in data.values():
+            if isinstance(value, Raw):
+                placeholders.append(value.expression)  # literal SQL expression
+            else:
+                # Use the correct placeholder style for driver
+                placeholders.append("?" if self.__driver__ == "mssql" else "%s")
+                params.append(value)
+
+        placeholders_str = ", ".join(placeholders)
+
+        if self.__driver__ == "mysql":
+            sql = f"INSERT INTO {self.__table__} ({columns}) VALUES ({placeholders_str})"
+        else:  # mssql
+            sql = f"INSERT INTO {self.__table__} ({columns}) OUTPUT INSERTED.* VALUES ({placeholders_str})"
+
+        if has_triggers:
+            sql = sql.replace("OUTPUT INSERTED.*", "")
+
+        pprint.pp(sql)
+        return sql, params
 
     def insert_get_id(self, data: dict[str, Any]):
         if not data:
@@ -1064,6 +1135,10 @@ class QueryBuilder:
         print("[DUMP RAW SQL]:", self.substitute_params(sql, params))
         return self
 
+    def to_raw_sql(self):
+        sql, params = self.get()
+        return self.substitute_params(sql, params)
+
     def _build_joins(self):
         return " ".join(self.joins) if self.joins else ""
 
@@ -1081,7 +1156,8 @@ class QueryBuilder:
             elif result.startswith("OR "):
                 result = result[3:]  # Remove leading "OR "
             return " WHERE " + result
-        return result.lstrip('AND ').lstrip('OR ')
+
+        return re.sub(r"^(AND |OR )", "", result)
 
     def to_sql(self, include_select=True):
         if hasattr(self, "__scopes_enabled__") and self.__scopes_enabled__:

@@ -1,0 +1,7 @@
+model = "gpt-5.1-codex-max"
+
+[sandbox_permissions]
+disk = [
+  "project-only",
+  "write:\"C:/Users/jrolle/PycharmProjects/TruiliAML Modular/.shared_env/Lib/site-packages/framework1\""
+]

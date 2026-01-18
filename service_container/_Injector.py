@@ -1,8 +1,10 @@
+import importlib
 import inspect
 import os
 import sys
 from functools import wraps
 from flask import current_app, has_app_context
+
 
 def get_parent_class(func):
     if not callable(func):
@@ -26,6 +28,7 @@ def get_parent_class(func):
             return obj
 
     return None
+
 
 def service_resolver(param, func_name: str):
     """Resolves and retrieves the appropriate service from the container."""
@@ -66,17 +69,23 @@ def injector(func):
                 if parent_class:
                     instance = parent_class()
                     return func(instance, *args, **kwargs)
-                raise 
+            raise
+
     return wrapper
+
 
 # Combined route and injector
 def injectable_route(app, route, prefix=None, **options):
     if prefix:
         route = f"{prefix}/{route}"
+
     def decorator(func):
-        #print(func.__name__)
+        # print(func.__name__)
         route_decorator = app.route(route, **options)
-        return route_decorator(injector(func))
+        return route_decorator(
+            injector(func)
+        )
+
     return decorator
 
 

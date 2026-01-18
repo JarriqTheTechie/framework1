@@ -1,15 +1,17 @@
 import os
-
+import re
 
 from flask import redirect
-import re
 import inflect
 from slugify import slugify
 
-from framework1.database.ActiveRecord import ActiveRecord
-
 # Initialize the inflect engine
 p = inflect.engine()
+
+
+def _validate_identifier(value: str):
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+        raise ValueError(f"Invalid name '{value}'. Use letters, numbers, and underscores; must start with a letter/underscore.")
 
 
 def split_camel_case(word: str) -> str:
@@ -39,6 +41,16 @@ def transform_word(raw_word: str):
         "snake_singular": to_snake_case(spaced),  # destruction_log
         "snake_plural": to_snake_case(plural_spaced),  # destruction_logs
     }
+
+
+def _write_file(path: str, content: str, overwrite: bool):
+    if os.path.exists(path) and not overwrite:
+        print(f"[skip] {path} already exists. Pass overwrite=True to replace.")
+        return False
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return True
 
 
 def parse_field_definition(field_str: str) -> dict:
@@ -74,7 +86,11 @@ def parse_field_definition(field_str: str) -> dict:
     return field
 
 
-def create_resource_handler(resource_name: str, database: str = None, field_definitions: list[str] = None):
+def create_resource_handler(resource_name: str, database: str = None, field_definitions: list[str] = None, overwrite: bool = False):
+    _validate_identifier(resource_name.replace("-", "_"))
+    if not database:
+        raise ValueError("database is required (service class name without extension).")
+    _validate_identifier(database)
     resource = transform_word(resource_name)
     title_singular = resource["title_singular"]
     title_plural = resource["title_plural"]
@@ -150,8 +166,7 @@ def create_resource_handler(resource_name: str, database: str = None, field_defi
 
 {{% endblock %}}
 '''
-            with open(os.path.join(subfolder_path, "index.html"), "w") as f:
-                f.write(template_content)
+            _write_file(os.path.join(subfolder_path, "index.html"), template_content, overwrite)
 
         # Generate create.html template
             template_content = '''{% extends 'base.html' %}
@@ -159,11 +174,11 @@ def create_resource_handler(resource_name: str, database: str = None, field_defi
 
     
     {{ form|safe }}
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
 {% endblock %}
 '''
-            with open(os.path.join(subfolder_path, "create.html"), "w") as f:
-                f.write(template_content)
+            _write_file(os.path.join(subfolder_path, "create.html"), template_content, overwrite)
 
             # Generate edit.html template
             template_content = '''{% extends 'base.html' %}
@@ -171,11 +186,11 @@ def create_resource_handler(resource_name: str, database: str = None, field_defi
 
     
     {{ form|safe }}
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
 {% endblock %}
 '''
-            with open(os.path.join(subfolder_path, "edit.html"), "w") as f:
-                f.write(template_content)
+            _write_file(os.path.join(subfolder_path, "edit.html"), template_content, overwrite)
 
             # Generate details.html template
             template_content = '''{% extends 'base.html' %}
@@ -183,11 +198,11 @@ def create_resource_handler(resource_name: str, database: str = None, field_defi
 
     
     {{ form|safe }}
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
 {% endblock %}
 '''
-            with open(os.path.join(subfolder_path, "details.html"), "w") as f:
-                f.write(template_content)
+            _write_file(os.path.join(subfolder_path, "details.html"), template_content, overwrite)
 
     # Generate model
     model_content = f'''from framework1.database.ActiveRecord import ActiveRecord
@@ -210,8 +225,8 @@ if __name__ == "__main__":
 '''
 
     model_path = os.path.join(base_path, "models", f"{pascal_singular}.py")
-    with open(model_path, "w") as f:
-        f.write(model_content)
+    if _write_file(model_path, model_content, overwrite):
+        print(f"[ok] Generated model: {model_path}")
 
 
     # Generate    form
@@ -272,9 +287,8 @@ class {pascal_singular}Form(Form):
     '''
 
     form_path = os.path.join(base_path, "forms", f"{pascal_singular}Form.py")
-    with open(form_path, "w") as f:
-        f.write(form_content)
-
+    if _write_file(form_path, form_content, overwrite):
+        print(f"[ok] Generated form: {form_path}")
 
         # Generate    table
         table_content = f'''from framework1.dsl.Table import Table, TextColumn
@@ -297,8 +311,8 @@ class {pascal_singular}Table(Table):
         '''
 
         table_path = os.path.join(base_path, "tables", f"{pascal_singular}Table.py")
-        with open(table_path, "w") as f:
-            f.write(table_content)
+        if _write_file(table_path, table_content, overwrite):
+            print(f"[ok] Generated table: {table_path}")
 
             # Generate    InfoList
             infolist_content = f'''from framework1.dsl.InfoList import InfoList, InfoListField
@@ -314,15 +328,11 @@ class {pascal_singular}InfoList(InfoList):
             '''
 
             infolist_path = os.path.join(base_path, "infolists", f"{pascal_singular}InfoList.py")
-            with open(infolist_path, "w") as f:
-                f.write(infolist_content)
+            if _write_file(infolist_path, infolist_content, overwrite):
+                print(f"[ok] Generated infolist: {infolist_path}")
 
 
     # Generate controller
-    route_path = resource_name.lower().replace('_', '-')
-    if not route_path.endswith('s'):
-        route_path += 's'
-
     controller_content = f'''from app import app
 from flask import render_template, abort
 from framework1.core_services.Request import Request
@@ -336,6 +346,10 @@ from flask import redirect, url_for
 class {pascal_singular}Controller:
     def __init__(self):
         pass
+
+    def _ensure_permission(self, action: str) -> bool:
+        \"\"\"Override to enforce per-action permissions.\"\"\"
+        return True
     
     def GetNavigation(self):
         return [
@@ -352,25 +366,39 @@ class {pascal_singular}Controller:
 
     @injectable_route(app, '/{slug_plural}', methods=['GET'])
     def {pascal_singular}Index(self, view_props: ViewProps, request: Request):
+        if not self._ensure_permission("list"):
+            return abort(403)
         page_title = "{title_plural}"
         table = {pascal_singular}Table().paginate(per_page=10)
         return render_template('{snake_plural}/templates/index.html', **view_props.compact())
 
     @injectable_route(app, '/{slug_plural}/<id>', methods=['GET'])
     def {pascal_singular}Details(self, id: int,view_props: ViewProps, request: Request):
+        if not self._ensure_permission("view"):
+            return abort(403)
         page_title = "{title_singular} Details"
         resource = {pascal_singular}().find(id)
+        if not resource:
+            return abort(404)
+        csrf_token = request.csrf_token()
         form = {pascal_singular}Form(resource.to_dict())
         return render_template('{snake_plural}/templates/details.html', **view_props.compact())                
 
     @injectable_route(app, '/{slug_plural}/create', methods=['GET'])
     def {pascal_singular}Create(self, view_props: ViewProps, request: Request):
+        if not self._ensure_permission("create"):
+            return abort(403)
         page_title = "Create {title_singular}"
+        csrf_token = request.csrf_token()
         form = {pascal_singular}Form(request.all())
         return render_template('{snake_plural}/templates/create.html', **view_props.compact())
 
-    @injectable_route(app, '/{route_path}/create', methods=['POST'])
+    @injectable_route(app, '/{slug_plural}/create', methods=['POST'])
     def {pascal_singular}Store(self, view_props: ViewProps, request: Request):
+        if not self._ensure_permission("create"):
+            return abort(403)
+        if not request.validate_csrf(request.input("csrf_token", "")):
+            return abort(400)
         page_title = "Create {title_singular}"
         resource, form = {pascal_singular}Form(request.all()).validate_and_create()
         if not resource:
@@ -378,14 +406,27 @@ class {pascal_singular}Controller:
         return redirect(url_for('{pascal_singular}Details', id=resource.id))
             
     @injectable_route(app, '/{slug_plural}/<id>/update', methods=['GET'])
-    def {pascal_singular}Edit(self, view_props: ViewProps, request: Request):
+    def {pascal_singular}Edit(self, id: int, view_props: ViewProps, request: Request):
+        if not self._ensure_permission("edit"):
+            return abort(403)
         page_title = "Edit {resource_name.replace('_', ' ').title()}"
-        form = {pascal_singular}Form(request.all())
+        resource = {pascal_singular}().find(id)
+        if not resource:
+            return abort(404)
+        csrf_token = request.csrf_token()
+        form = {pascal_singular}Form(resource.to_dict())
         return render_template('{snake_plural}/templates/edit.html', **view_props.compact())
 
     @injectable_route(app, '/{slug_plural}/<id>/update', methods=['POST'])
     def {pascal_singular}Update(self, id: int,view_props: ViewProps, request: Request):
+        if not self._ensure_permission("edit"):
+            return abort(403)
         page_title = "Edit {title_singular}"
+        existing = {pascal_singular}().find(id)
+        if not existing:
+            return abort(404)
+        if not request.validate_csrf(request.input("csrf_token", "")):
+            return abort(400)
         resource, form = {pascal_singular}Form(request.all()).validate_and_update(id)
         if not resource:
             return render_template('{snake_plural}/templates/edit.html', **view_props.compact())
@@ -393,13 +434,7 @@ class {pascal_singular}Controller:
 '''
 
     controller_path = os.path.join(base_path, f"{pascal_singular}Controller.py")
-    with open(controller_path, "w") as f:
-        f.write(controller_content)
+    if _write_file(controller_path, controller_content, overwrite):
+        print(f"[ok] Generated controller: {controller_path}")
 
-    print(f"✨ Created resource handler: {base_path}")
-    print(f"✨ Generated template: {os.path.join(base_path, 'templates', 'index.html')}")
-    print(f"✨ Generated model: {model_path}")
-    print(f"✨ Generated controller: {controller_path}")
-    print(f"✨ Generated form: {form_path}")
-    print(f"✨ Generated table: {table_path}")
-    print(f"✨ Generated infolist: {infolist_path}")
+    print(f"[ok] Created resource scaffold at: {base_path}")

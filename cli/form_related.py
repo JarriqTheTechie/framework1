@@ -5,7 +5,16 @@ import re
 from typing import List
 
 
-def generate_form(resource_name: str, is_table: bool = False):
+def _write_file(path: pathlib.Path, content: str, overwrite: bool):
+    if path.exists() and not overwrite:
+        print(f"[skip] {path} already exists. Pass overwrite=True to replace.")
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return True
+
+
+def generate_form(resource_name: str, is_table: bool = False, overwrite: bool = False):
     """
     Generate a form in the lib/handlers/resource/forms folder based on the model
     in the lib/handlers/resource/models folder.
@@ -29,13 +38,13 @@ def generate_form(resource_name: str, is_table: bool = False):
 
     # Validate the resource directory structure exists
     if not models_path.exists() or not forms_path.exists():
-        print(f"❌ Resource '{resource_name}' does not exist or structure is invalid.")
+        print(f"[error] Resource '{resource_name}' does not exist or structure is invalid.")
         return
 
     # Find the model file
     model_files = list(models_path.glob("*.py"))
     if not model_files:
-        print(f"❌ No model found in {models_path}")
+        print(f"[error] No model found in {models_path}")
         return
 
     # Using the first model file (files are typically unique per resource)
@@ -48,12 +57,12 @@ def generate_form(resource_name: str, is_table: bool = False):
     # Extract the model class name
     model_class_match = re.search(r"class (\w+)\(ActiveRecord\):", model_content)
     if not model_class_match:
-        print(f"❌ No ActiveRecord class found in {model_file}")
+        print(f"[error] No ActiveRecord class found in {model_file}")
         return
     model_class_name = model_class_match.group(1)
 
     if not is_table:
-        print(f"✨ Generating form for model: {model_class_name}")
+        print(f"[ok] Generating form for model: {model_class_name}")
         fields = []
         fields_string = ""
         field_lines = re.findall(r"^\s+(\w+)\s+=\s+(\w+Field.*?)$", model_content, re.MULTILINE)
@@ -62,8 +71,7 @@ def generate_form(resource_name: str, is_table: bool = False):
             fields_string += f"""                    TextField('{field_name}').set_label("{field_name.replace("_", " ").title()}").set_class("form-control ps-1"),\n"""
 
         # Generate the form content
-        form_content = f"""from framework1.dsl.FormDSL.TextField import TextField
-from typing import List
+        form_content = f"""from typing import List
 from framework1.dsl.FormDSL.TextField import TextField
 from framework1.dsl.FormDSL.BaseField import BaseField
 from framework1.dsl.FormDSL.FieldGroup import FieldGroup
@@ -115,12 +123,10 @@ class {pascal_singular}Form(Form):
 
         # Save the form
         form_file_path = forms_path / f"{pascal_singular}Form.py"
-        with open(form_file_path, "w") as f:
-            f.write(form_content)
-
-            print(f"✨ Form generated: {form_file_path}")
+        if _write_file(form_file_path, form_content, overwrite):
+            print(f"[ok] Form generated: {form_file_path}")
     else:
-        print(f"✨ Generating table for model: {model_class_name}")
+        print(f"[ok] Generating table for model: {model_class_name}")
         fields = []
         fields_string = ""
         field_lines = re.findall(r"^\s+(\w+)\s+=\s+(\w+Field.*?)$", model_content, re.MULTILINE)
@@ -148,10 +154,9 @@ class {pascal_singular}Table(Table):
 
                 '''
 
-        table_path = os.path.join(base_path, "tables", f"{pascal_singular}Table.py")
-        with open(table_path, "w") as f:
-            f.write(table_content)
-            print(f"✨ Table generated: {table_path}")
+        table_path = pathlib.Path(base_path) / "tables" / f"{pascal_singular}Table.py"
+        if _write_file(table_path, table_content, overwrite):
+            print(f"[ok] Table generated: {table_path}")
 
 #########################################################################
 
@@ -176,8 +181,7 @@ class {pascal_singular}InfoList(InfoList):
 
                 '''
 
-        infolsit_path = os.path.join(base_path, "infolists", f"{pascal_singular}InfoList.py")
-        with open(infolsit_path, "w") as f:
-            f.write(infolist_content)
-            print(f"✨ Infolist generated: {infolsit_path}")
+        infolsit_path = pathlib.Path(base_path) / "infolists" / f"{pascal_singular}InfoList.py"
+        if _write_file(infolsit_path, infolist_content, overwrite):
+            print(f"[ok] Infolist generated: {infolsit_path}")
 

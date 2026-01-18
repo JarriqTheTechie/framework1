@@ -31,6 +31,7 @@ def parse_connection_string(conn_str: str) -> dict:
 
     return parsed
 
+
 class F1TableFilterForm(Form):
     def __init__(self, data):
         resource = Request().path().split("/")[-1]
@@ -48,8 +49,6 @@ class F1TableFilterForm(Form):
 
         super().__init__(data)
 
-
-
     def set_resource_from_table(self, table):
         self.table = table.__class__
         self.model = table.__class__.model
@@ -58,7 +57,8 @@ class F1TableFilterForm(Form):
         try:
             self.database_schema = table.__class__.model.__database__.connection_dict['database']
         except KeyError:
-            self.database_schema = parse_connection_string(table.__class__.model.__database__.connection_string).get('DATABASE')
+            self.database_schema = parse_connection_string(table.__class__.model.__database__.connection_string).get(
+                'DATABASE')
 
         information_schema = InformationSchema
         information_schema.__driver__ = self.model.__driver__
@@ -93,14 +93,20 @@ class F1TableFilterForm(Form):
     def schema(self) -> List[BaseField | FieldGroup]:
         if self.information_schema.__driver__ == "mysql":
             table_name = self.db_table.replace(f"{self.database_schema}.", "")
-            table_columns = self.information_schema.select("COLUMN_NAME").where("TABLE_NAME", table_name).where("TABLE_SCHEMA",
-                                                                                                           self.database_schema).order_by(
+            table_columns = self.information_schema.select("COLUMN_NAME").where("TABLE_NAME", table_name).where(
+                "TABLE_SCHEMA",
+                self.database_schema).order_by(
                 "COLUMN_NAME").all()
         else:
-            table_columns = self.information_schema.select("COLUMN_NAME").table(f"[{self.database_schema}].INFORMATION_SCHEMA.COLUMNS").where("TABLE_NAME", self.db_table).where(
+            table_columns = self.information_schema.select("COLUMN_NAME").table(
+                f"[{self.database_schema}].INFORMATION_SCHEMA.COLUMNS").where("TABLE_NAME", self.db_table).where(
                 "TABLE_SCHEMA", "dbo").order_by("ORDINAL_POSITION").all()
-        table_columns = [column for column in table_columns if column.COLUMN_NAME in self.table.filterable_fields]
 
+        table_columns_ = []
+        for column in table_columns:
+            for user_defined_filter_field in self.table.filterable_fields:
+                if column.COLUMN_NAME == user_defined_filter_field.split(".")[-1]:
+                    table_columns_.append(user_defined_filter_field)
 
         return [
             FieldGroup(
@@ -113,7 +119,7 @@ class F1TableFilterForm(Form):
                         "form-select form-select-sm w-auto"),
                     SelectField(f"field[]").set_label("Field Name").set_class(
                         "form-select form-select-sm").set_options([
-                        (column.COLUMN_NAME, column.COLUMN_NAME.replace("_", " ").title()) for column in table_columns
+                        column for column in table_columns_
                     ]),
 
                     SelectField(f"operator[]").set_label("Operator").set_class(
@@ -140,7 +146,7 @@ class F1TableFilterForm(Form):
 
             ).set_field_container_class("").set_title_class("h6 fw-bold ps-0")
             .set_class("col-12 filter-row d-flex align-items-center gap-2").wrap_in_div_with_class_and_id("filterRows",
-                                                                                                      "filterRows"),
+                                                                                                          "filterRows"),
             FieldGroup(
                 "",
                 fields=[

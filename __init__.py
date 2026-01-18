@@ -3,24 +3,171 @@ import importlib.util
 import inspect
 import json
 import os
-import sys
 import pathlib
 import subprocess
+import sys
 import time
 from datetime import datetime
+from typing import TypedDict, Any
+from flask import current_app, template_rendered
 
 import click
 import markupsafe
+from blinker import Namespace
 from dotenv import load_dotenv
-from flask import Flask, redirect
-from flask import g, request, render_template_string
+from flask import Flask
+from flask import g, request, render_template_string, has_app_context
 from framework1.core_services.Request import Request
+from framework1.database.ActiveRecord import ActiveRecord
+from framework1.utilities.DataKlass import DataKlass
 from jinja2 import FileSystemLoader
 
 from .interfaces.LifecycleAware import LifecycleAware
 from .service_container._Injector import injector, injectable_route
 from .service_container._ServiceContainer import ServiceContainer
 from .service_container._ServiceLoader import init_container
+
+my_signals = Namespace()
+model_loaded = my_signals.signal('model_loaded')
+
+from collections import defaultdict
+
+
+# Define your singleton class
+class SingletonObject:
+    def __init__(self):
+        self.data = None
+        self.queries = []
+
+
+# Create a function to get or create the singleton object
+def get_singleton_object():
+    if not has_app_context():
+        raise RuntimeError("Not in app context")
+
+    if not hasattr(g, 'singleton_object'):
+        g.singleton_object = SingletonObject()
+    return g.singleton_object
+
+
+def hydrated(self):
+    print("Hydrated model:", self.__class__.__name__)
+    model_loaded.send(self)
+
+
+def all_subclasses(cls):
+    subclasses = cls.__subclasses__()
+    for subclass in subclasses:
+        subclasses.extend(all_subclasses(subclass))
+    return subclasses
+
+
+class ModelCollectorState:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.start_time = time.perf_counter()
+        self.models_processed = 0
+        self.items_collected = 0
+        self.bytes_collected = 0
+        self.warnings = []
+        self.raw_dump = []
+
+    def add_item(self, model_name, data):
+        self.models_processed += 1
+        self.items_collected += 1
+        self.bytes_collected += sys.getsizeof(data)
+
+        # store for debugging (optional)
+        self.raw_dump.append(
+            {"model": model_name, "data": data}
+        )
+
+    @property
+    def elapsed_ms(self):
+        return round((time.perf_counter() - self.start_time) * 1000, 2)
+
+    @property
+    def memory_kb(self):
+        return round(self.bytes_collected * 0.0009765625, 2)
+
+
+def get_collector_state():
+    if not hasattr(g, "collector_state"):
+        g.collector_state = ModelCollectorState()
+    return g.collector_state
+
+
+class ModelCollector(dict):
+    """
+    Lightweight container for collected model data.
+    Always stores: model (string), data (list), count (int)
+    """
+
+    def __init__(self, model: str, data: list):
+        super().__init__(
+            model=model,
+            data=data,
+            count=len(data)
+        )
+
+
+def pass_model_to_g(model):
+    if not has_app_context():
+        return False
+
+    state = get_collector_state()
+    model_name = model.__class__.__name__
+
+    fields = model.__class__.get_fields()
+    data = {
+        k: v for k, v in model.__data__.items()
+        if k in fields and v is not None
+    }
+
+    # record performance event
+    state.add_item(model_name, data)
+
+    if not hasattr(g, "models"):
+        g.models = [ModelCollector(model_name, [data])]
+        return True
+
+    for item in g.models:
+        if item["model"] == model_name:
+            item["data"].append(data)
+            item["count"] = len(item["data"])
+            return True
+
+    g.models.append(ModelCollector(model_name, [data]))
+    return True
+
+
+def debug_collector():
+    state = get_collector_state()
+
+    print("\n=== MODEL COLLECTION DEBUG ===")
+    print(f"Models processed:   {state.models_processed}")
+    print(f"Items collected:    {state.items_collected}")
+    print(f"Memory collected:   {state.memory_kb} kb")
+    print(f"Time elapsed:       {state.elapsed_ms} ms")
+
+    if state.warnings:
+        print("\nWarnings:")
+        for w in state.warnings:
+            print(" -", w)
+
+    print("\nRaw collected items:")
+    pprint.pprint(state.raw_dump)
+
+
+def reset_collector():
+    state = get_collector_state()
+    state.reset()
+    if hasattr(g, "models"):
+        del g.models
+    if hasattr(g, "model_debug"):
+        del g.model_debug
 
 
 def render_template_string_safe_internal(relative_path, **context):
@@ -165,6 +312,7 @@ def collect_navigation_items(app: Flask, debug=False):
 def Framework1(app: Flask, debug=False, **kwargs):
     load_dotenv()
     app.secret_key = os.getenv('APP_SECRET_KEY')
+    app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 60 * 60 * 24 * 30  # 30 days
 
     """Initializes the Flask application with service containers, dynamic module imports,
     and template/static configurations.
@@ -183,6 +331,24 @@ def Framework1(app: Flask, debug=False, **kwargs):
     app.static_folder = os.path.join(os.getcwd(), "lib/resources")
 
     # app.static_url_path = '/resources'
+
+    model_loaded.connect(pass_model_to_g)
+    models = all_subclasses(ActiveRecord)
+    for model in models:
+        model.on("retrieved", hydrated)
+
+    @app.before_request
+    def init_model_collection():
+        g.models = []
+        g.collector_state = ModelCollectorState()
+        g.model_debug = {
+            "models_processed": 0,
+            "items_collected": 0,
+            "memory_collected": "0 kb",
+            "collection_time": "0 ms",
+            "warnings": [],
+            "grouped_summary": []
+        }
 
     @app.before_request
     def _framework1_before_request():
@@ -320,6 +486,14 @@ def Framework1(app: Flask, debug=False, **kwargs):
             return json.loads(value)
         except json.JSONDecodeError:
             return value  # Return the original value if parsing fails
+
+    @app.template_filter("asdict")
+    def asdict_filter(val):
+        if isinstance(val, list):
+            return [v.to_dict() if isinstance(v, DataKlass) else v for v in val]
+        if isinstance(val, DataKlass):
+            return val.to_dict()
+        return val
 
     @app.template_filter("PageTitle")
     def page_title(value):

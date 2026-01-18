@@ -17,6 +17,7 @@ class _ModalBase:
         self.trigger_label = "Open"
         self.trigger_class = "btn btn-primary"
         self.trigger_icon = ""
+        self.trigger_type = "button"
 
     def title(self, text: str) -> Self:
         self.modal_title = text

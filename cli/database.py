@@ -1,14 +1,32 @@
 import os
+import re
 
 
-def create_database_service(name: str, db_type: str):
+def _validate_identifier(name: str):
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise ValueError(f"Invalid name '{name}'. Use letters, numbers, and underscores; must start with a letter/underscore.")
+
+
+def _db_import_block(driver: str) -> str:
+    """Return a defensive import block for MySQL/MSSQL drivers across layouts."""
+    class_name = f"{driver}Database"
+    return f"""try:
+    from framework1.core_services.database.{class_name} import {class_name}
+except ImportError:
+    from framework1.core_services.{class_name} import {class_name}
+"""
+
+
+def create_database_service(name: str, db_type: str, overwrite: bool = False):
     """Create a new database service file."""
+    _validate_identifier(name)
     services_path = os.path.join("lib", "services")
     os.makedirs(services_path, exist_ok=True)
 
-    if db_type.lower() == "mysql":
-        content = f'''from framework1.core_services.MySqlDatabase import MySqlDatabase
-from framework1.interfaces.LifecycleAware import LifecycleAware
+    db_type_lower = db_type.lower()
+    if db_type_lower == "mysql":
+        imports = _db_import_block("MySql")
+        content = f'''{imports}
 
 class {name}Database(MySqlDatabase):
     env = "prod"
@@ -20,9 +38,10 @@ class {name}Database(MySqlDatabase):
         database="DATABASE NAME",
     )
 '''
-    elif db_type.lower() == "mssql":
-        content = f'''from framework1.core_services.MSSQLDatabase import MSSQLDatabase
-from framework1.interfaces.LifecycleAware import LifecycleAware
+    elif db_type_lower == "mssql":
+        imports = _db_import_block("MSSQL")
+        content = f'''{imports}
+
 
 class {name}Database(MSSQLDatabase):
     connection_string = 'DRIVER={{ODBC Driver 17 for SQL Server}};' \\
@@ -38,7 +57,12 @@ class {name}Database(MSSQLDatabase):
     filename = f"{name}Database.py"
     filepath = os.path.join(services_path, filename)
 
-    with open(filepath, 'w') as f:
+    if os.path.exists(filepath) and not overwrite:
+        print(f"[skip] {filepath} already exists. Pass overwrite=True to replace.")
+        return filepath
+
+    with open(filepath, 'w', encoding='utf-8') as f:
         f.write(content)
 
-    print(f"✨ Created database service: {filepath}")
+    print(f"[ok] Created database service: {filepath}")
+    return filepath

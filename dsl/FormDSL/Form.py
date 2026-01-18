@@ -21,6 +21,7 @@ class Form:
         self.method = "POST"
         self.action = ""
         self.style = ""
+        self.data_attributes = {}
 
     def get_create_button_text(self) -> str:
         """Override this method to customize create button text."""
@@ -86,27 +87,25 @@ class Form:
             self.action = action
         return self
 
-    def schema(self) -> List[BaseField| FieldGroup]:
+    def schema(self) -> List[BaseField | FieldGroup]:
         """Override this method to define schema."""
         return []
 
     def validate(self) -> bool:
-        """Validate all fields in the form and collect errors."""
         self.errors.clear()
         valid = True
+
         for item in self.schema():
             if isinstance(item, FieldGroup):
-                # Validate each field in the FieldGroup
                 for field in item.fields:
                     value = self.data.get(field.name, "")
-                    field_errors = field.validate(value)
+                    field_errors = field.validate(value, context=self)
                     if field_errors:
                         self.errors[field.name] = field_errors
                         valid = False
             else:
-                # Validate individual BaseField directly
                 value = self.data.get(item.name, "")
-                field_errors = item.validate(value)
+                field_errors = item.validate(value, context=self)
                 if field_errors:
                     self.errors[item.name] = field_errors
                     valid = False
@@ -115,15 +114,14 @@ class Form:
     def render_errors(self, field_name) -> str:
 
         if field_name in self.errors:
-            error_html = "".join(f'<p class="error">{error}</p>' for error in self.errors[field_name])
-            return f'<div class="error-messages">{error_html}</div>'
+            error_html = "".join(f'<p class="validation-error">{error}</p>' for error in self.errors[field_name])
+            return f'<div class="error-messages mx-2">{error_html}</div>'
         return ""
 
     def visible_on(self, boolean: bool) -> 'Form':
         """Set the visibility of the form."""
         self.visible = boolean
         return self
-
 
     def set_enctype(self, enctype: str) -> 'Form':
         self.enctype = enctype
@@ -133,13 +131,27 @@ class Form:
         self.data = data
         return self
 
+    def set_data_attribute(self, key: str, value: str, js_inline=False) -> 'BaseField':
+        """Set a data attribute for the field."""
+        if not js_inline:
+            self.data_attributes[key] = value
+        else:
+            self.data_attributes[key] = self.js_inline(value).rstrip(";").strip()
+            print(self.js_inline(value).rstrip(";").strip())
+        return self
+
+    def explode_data_attributes(self) -> str:
+        """Return all data attributes in HTML format."""
+        return " ".join([f'{key}="{value}"' for key, value in self.data_attributes.items()])
+
     def render(self) -> Markup | str:
         if self.visible:
-            html = f'<form action="{self.action}" method="{self.method}" class="{self.class_name}" id="{self.__class__.__name__}" style="{self.style}" enctype="{self.enctype}">\n'
+            html = f'<form action="{self.action}" method="{self.method}" class="{self.class_name}" id="{self.__class__.__name__}" style="{self.style}" enctype="{self.enctype}" {self.explode_data_attributes()} >\n'
             outer_class = "form-group"
 
             loop_counter = 1
-            loop_length = 1 #len(self.schema())
+            loop_length = 1  # len(self.schema())
+            
             for item in self.schema():
                 if isinstance(item, FieldGroup):
                     item.form = self
@@ -158,7 +170,6 @@ class Form:
         else:
             html = ""
         return Markup(html)
-
 
     def __str__(self) -> str:
         return self.render()

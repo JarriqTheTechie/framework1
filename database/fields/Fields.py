@@ -22,8 +22,23 @@ class Field:
         self.comment = comment
         self.collation = collation
 
+    # ----------------------------
+    # Descriptor interface
+    # ----------------------------
+    def __set_name__(self, owner, name):
+        self.name = name
+
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            return self
+        return instance.__data__.get(self.name, self.default)
+
+    def __set__(self, instance, value):
+        instance.__data__[self.name] = value
+
     def get_sql_type(self) -> str:
         raise NotImplementedError("Subclasses must implement get_sql_type()")
+
 
 
 class IntegerField(Field):
@@ -33,24 +48,18 @@ class IntegerField(Field):
 
     def get_sql_type(self) -> str:
         base_type = "INTEGER"
-        if self.auto_increment:
-            base_type += " AUTO_INCREMENT"
         return base_type
 
 
 class BigIntegerField(IntegerField):
     def get_sql_type(self) -> str:
         base_type = "BIGINT"
-        if self.auto_increment:
-            base_type += " AUTO_INCREMENT"
         return base_type
 
 
 class SmallIntegerField(IntegerField):
     def get_sql_type(self) -> str:
         base_type = "SMALLINT"
-        if self.auto_increment:
-            base_type += " AUTO_INCREMENT"
         return base_type
 
 
@@ -61,6 +70,8 @@ class CharField(Field):
 
     def get_sql_type(self) -> str:
         return f"VARCHAR({self.max_length})"
+
+
 
 
 class TextField(Field):
@@ -89,6 +100,14 @@ class DateTimeField(Field):
         self.auto_now = auto_now
         self.auto_now_add = auto_now_add
 
+    def __set__(self, instance, value):
+        from datetime import datetime, date
+        if isinstance(value, date) and not isinstance(value, datetime):
+            value = datetime.combine(value, datetime.min.time())
+        elif isinstance(value, str):
+            value = datetime.fromisoformat(value)
+        super().__set__(instance, value)
+
     def get_sql_type(self) -> str:
         return "DATETIME"
 
@@ -98,6 +117,13 @@ class DateField(Field):
         super().__init__(**kwargs)
         self.auto_now = auto_now
         self.auto_now_add = auto_now_add
+
+    def __set__(self, instance, value):
+        if isinstance(value, datetime):
+            value = value.date()
+        elif isinstance(value, str):
+            value = datetime.fromisoformat(value).date()
+        super().__set__(instance, value)
 
     def get_sql_type(self) -> str:
         return "DATE"
@@ -112,6 +138,24 @@ class JsonField(Field):
     def get_sql_type(self) -> str:
         return "JSON"
 
+class MSSQLJsonField(Field):
+    def get_sql_type(self) -> str:
+        return "NVARCHAR(MAX)"
+
+
+class MSSQLTimestampField(Field):
+    def __init__(self, auto_update: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.auto_update = auto_update
+
+    def get_sql_type(self) -> str:
+        if self.auto_update:
+            return "DATETIME2 DEFAULT SYSUTCDATETIME()"
+        return "DATETIME2"
+    
+class MSSQLBooleanField(Field):
+    def get_sql_type(self) -> str:
+        return "BIT"
 
 class BinaryField(Field):
     def __init__(self, max_length: Optional[int] = None, **kwargs):

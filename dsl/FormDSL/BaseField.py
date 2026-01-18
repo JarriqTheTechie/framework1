@@ -99,7 +99,7 @@ class BaseField:
         self.disabled = disabled
         return self
 
-    def set_hidden(self, lambda_func: Callable | bool=True) -> 'BaseField':
+    def set_hidden(self, lambda_func: Callable | bool = True) -> 'BaseField':
         """Set a lambda function to determine if the field should be hidden."""
         match lambda_func:
             case True:
@@ -110,7 +110,7 @@ class BaseField:
             case _:
                 self.hidden = "hidden"
                 self.field_hidden = "d-none "
-            
+
         return self
 
     def set_script(self, script: str) -> 'BaseField':
@@ -146,11 +146,11 @@ class BaseField:
         import re
         return self.add_validation(lambda v: re.match(regex, v) is not None, error_message)
 
-    def validate(self, value) -> List[str]:
+    def validate(self, value, context=None) -> List[str]:
         """Run all validations and return a list of error messages (if any)."""
         errors = []
         for rule in self.validation_rules:
-            error = rule.validate(value)
+            error = rule.validate(value, context)
             if error:
                 errors.append(error)
         return errors
@@ -186,7 +186,8 @@ class BaseField:
             case "bottom":
                 self.help_text_position = "below"
             case _:
-                raise Exception(f"Invalid position: {position} for help text on field {self.name}. Use 'above' or 'below'.")
+                raise Exception(
+                    f"Invalid position: {position} for help text on field {self.name}. Use 'above' or 'below'.")
         self.help_text_position = position
         return self
 
@@ -229,6 +230,24 @@ class BaseField:
         self.label_position = position
         return self
 
+    def inherit_controller_from(self, parent):
+        """Inherit parent controller name so .target() and .value() resolve correctly."""
+        self._stimulus_controller = getattr(parent, "_stimulus_controller", None)
+        return self
+
+    def target(self, name: str, controller: str|None) -> 'BaseField':
+        if controller is None:
+            controller = getattr(self, "_stimulus_controller", None)
+        else:
+            if isinstance(controller, str):
+                controller = controller
+            else:
+                controller = getattr(controller, "_stimulus_controller", None)
+        if not controller:
+            raise ValueError(f"Stimulus controller not set for {self.name}.")
+        self.set_data_attribute(f"data-{controller}-target", name)
+        return self
+
     def render_input(self, value="", record={}) -> str:
         readonly_attr = " readonly" if self.readonly else ""
         disabled_attr = " disabled" if self.disabled else ""
@@ -252,6 +271,7 @@ class BaseField:
             """
 
         return ""
+
 
 class RawField(BaseField):
     def __init__(self, name: str, field_type: str = "text"):
