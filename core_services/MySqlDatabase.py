@@ -25,7 +25,6 @@ class MySqlDatabase(Database):
         self.connection = mysql.connector.connect(
             **self.connection_dict
         )
-        # self.connection.add_output_converter(-16, handle_unsupported_dtype)
         self.cursor = self.connection.cursor(dictionary=True)
         return self.cursor
 
@@ -39,20 +38,25 @@ class MySqlDatabase(Database):
             args = tuple(args)
 
         try:
-
             start_time = time.perf_counter()
             cur = self.connect()
-            print(query_str, args)
             cur.execute(query_str, args)
-
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             self._log_query(query_str, args, elapsed_ms)
+            results = [self.DotDict(row) for row in cur.fetchall()]
+            self.results = results
+            return results
         except mysql.connector.errors.ProgrammingError as e:
             self.logger.error(f"ProgrammingError: {e}")
             raise
-
-        self.results = [self.DotDict(row) for row in self.cursor.fetchall()]
-        return self.results
+        finally:
+            try:
+                if self.cursor:
+                    self.cursor.close()
+                if self.connection and self.connection.is_connected():
+                    self.connection.close()
+            except Exception:
+                pass
 
     def pquery(self, queries, *args):
         # Convert args to list if it's not already
@@ -110,6 +114,13 @@ class MySqlDatabase(Database):
                 all_results.append({keys[key_position]: [self.DotDict(row) for row in resultset]})
                 key_position += 1
 
+        try:
+            if self.cursor:
+                self.cursor.close()
+            if self.connection and self.connection.is_connected():
+                self.connection.close()
+        except Exception:
+            pass
         return all_results
 
     def save(self, table: str, data: dict[str, Any], where: dict[str, Any] = None, primary_key: str = "id"):
@@ -130,7 +141,6 @@ class MySqlDatabase(Database):
             self.connection.commit()
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             self._log_query(sql, values, elapsed_ms)
-            print(f"Updated rows: {cursor.rowcount}")
             return self.query(f"SELECT * FROM `{table}` WHERE {where_clause}", *where.values())[
                 0] if cursor.rowcount else None
         else:
@@ -145,7 +155,6 @@ class MySqlDatabase(Database):
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             self._log_query(sql, values, elapsed_ms)
             inserted_id = cursor.lastrowid
-            print(f"Inserted ID: {inserted_id}")
             if inserted_id:
                 return self.query(f"SELECT * FROM `{table}` WHERE `{primary_key}` = %s", inserted_id)[0]
             return None

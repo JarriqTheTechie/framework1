@@ -56,6 +56,7 @@ class UploadedFile:
 
         if not upload_dir:
             upload_dir = "uploads"
+        os.makedirs(upload_dir, exist_ok=True)
 
         extension: str = self.extension()
         if keep_name is True:
@@ -81,7 +82,10 @@ class UploadedFile:
         return self.file.content_type
 
     def size(self, format: str = 'kb'):
-        size = len(self.file.read())
+        current_pos = self.file.stream.tell()
+        self.file.stream.seek(0, os.SEEK_END)
+        size = self.file.stream.tell()
+        self.file.stream.seek(current_pos, os.SEEK_SET)
         if format == 'kb':
             return round(size / 1024, 2)
         elif format == 'mb':
@@ -101,7 +105,8 @@ class Request:
         self.request.session = session
 
     def __get_json(self):
-        if self.request.content_type == 'application/json':
+        content_type = (self.request.content_type or "").lower()
+        if content_type.startswith("application/json") or content_type.endswith("+json"):
             return self.request.json
         return {}
 
@@ -514,14 +519,18 @@ class Request:
     def request(self):
         return request
 
+    @property
+    def session(self):
+        return session
+
     def flash(self):
-        self.request.flash(self.all(), "old")
+        flash(self.all(), "old")
 
     def flash_only(self, keys: list):
-        self.request.flash(self.only(keys), "old")
+        flash(self.only(keys), "old")
 
     def flash_except(self, keys: list):
-        self.request.flash(self.except_(keys), "old")
+        flash(self.except_(keys), "old")
 
     def old(self, key: str, default=None) -> Any:
         val: list[tuple] = get_flashed_messages(True, "old")

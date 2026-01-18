@@ -47,9 +47,9 @@ class MSSQLDatabase(Database):
             query_str, args = query_str.get()
 
         query_str = query_str.replace("%s", "?")
-        print(query_str)
         start_time = time.perf_counter()
-        self.connect().execute(query_str, *args)
+        cur = self.connect()
+        cur.execute(query_str, *args)
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         if len(args) == 0:
@@ -63,6 +63,14 @@ class MSSQLDatabase(Database):
             self.results = result_to_dotdict(columns, raw_results, self.DotDict)
         except TypeError:
             self.results = []
+        finally:
+            try:
+                if self.cursor:
+                    self.cursor.close()
+                if self.connection:
+                    self.connection.close()
+            except Exception:
+                pass
         return self.results
 
     def pquery(self, queries, *args):
@@ -110,6 +118,13 @@ class MSSQLDatabase(Database):
             columns = [column[0] for column in cursor.description]
             results_as_tuple.append({keys[key_position]: result_to_dotdict(columns, cursor.fetchall(), self.DotDict)})
             key_position += 1
+        try:
+            if self.cursor:
+                self.cursor.close()
+            if self.connection:
+                self.connection.close()
+        except Exception:
+            pass
         return results_as_tuple
 
     def save(
@@ -146,7 +161,6 @@ class MSSQLDatabase(Database):
             self.connection.commit()
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             self._log_query(sql, values, elapsed_ms)
-            print(f"Updated rows: {cursor.rowcount}")
 
             if cursor.rowcount:
                 where_params = tuple(where.values())
@@ -164,7 +178,6 @@ class MSSQLDatabase(Database):
             self.connection.commit()
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             self._log_query(sql, values, elapsed_ms)
-            print("Insert successful.")
 
             # Fetch last inserted row (assumes IDENTITY column is `primary_key`)
             identity_query = f"SELECT IDENT_CURRENT('{table}') AS [{primary_key}]"

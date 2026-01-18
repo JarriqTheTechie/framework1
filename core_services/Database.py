@@ -124,8 +124,7 @@ class Database(Protocol):
         })
 
     def requires_commit(self, query: str):
-        if query.lower().startswith(("insert", "update", "delete")):
-            return True
+        return query.lower().startswith(("insert", "update", "delete"))
 
     def connect(self):
         pass
