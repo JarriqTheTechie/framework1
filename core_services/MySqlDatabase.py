@@ -22,9 +22,16 @@ class MySqlDatabase(Database):
         super().__init__()
 
     def connect(self):
-        self.connection = mysql.connector.connect(
-            **self.connection_dict
-        )
+        # Allow optional pooling settings if provided in connection_dict
+        connect_kwargs = self.connection_dict.copy()
+        pool_name = connect_kwargs.pop("pool_name", None)
+        pool_size = connect_kwargs.pop("pool_size", None)
+        if pool_name:
+            connect_kwargs["pool_name"] = pool_name
+        if pool_size:
+            connect_kwargs["pool_size"] = pool_size
+
+        self.connection = mysql.connector.connect(**connect_kwargs)
         self.cursor = self.connection.cursor(dictionary=True)
         return self.cursor
 
@@ -50,13 +57,7 @@ class MySqlDatabase(Database):
             self.logger.error(f"ProgrammingError: {e}")
             raise
         finally:
-            try:
-                if self.cursor:
-                    self.cursor.close()
-                if self.connection and self.connection.is_connected():
-                    self.connection.close()
-            except Exception:
-                pass
+            self._cleanup()
 
     def pquery(self, queries, *args):
         # Convert args to list if it's not already
@@ -94,13 +95,10 @@ class MySqlDatabase(Database):
 
         # self.logger.info(f"PQUERY [PRE-EXECUTION] {final_query}")
 
-        with self.connect() as cur:
-            start_time = time.perf_counter()
-            try:
-                cur.execute(final_query, tuple(args_list))
-            except mysql.connector.errors.ProgrammingError as e:
-                self.logger.error(final_query)
-                raise
+        cur = self.connect()
+        start_time = time.perf_counter()
+        try:
+            cur.execute(final_query, tuple(args_list))
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             self._log_query(final_query, args_list, elapsed_ms, event_name="sql_pquery")
 
@@ -113,14 +111,12 @@ class MySqlDatabase(Database):
                 resultset = cur.fetchall()
                 all_results.append({keys[key_position]: [self.DotDict(row) for row in resultset]})
                 key_position += 1
+        except mysql.connector.errors.ProgrammingError as e:
+            self.logger.error(final_query)
+            raise
+        finally:
+            self._cleanup()
 
-        try:
-            if self.cursor:
-                self.cursor.close()
-            if self.connection and self.connection.is_connected():
-                self.connection.close()
-        except Exception:
-            pass
         return all_results
 
     def save(self, table: str, data: dict[str, Any], where: dict[str, Any] = None, primary_key: str = "id"):
@@ -158,6 +154,15 @@ class MySqlDatabase(Database):
             if inserted_id:
                 return self.query(f"SELECT * FROM `{table}` WHERE `{primary_key}` = %s", inserted_id)[0]
             return None
+
+    def _cleanup(self):
+        try:
+            if getattr(self, "cursor", None):
+                self.cursor.close()
+            if getattr(self, "connection", None) and self.connection.is_connected():
+                self.connection.close()
+        except Exception:
+            pass
 
     @contextmanager
     def transaction(self) -> Generator[mysql.connector.connection.MySQLConnection, None, None]:

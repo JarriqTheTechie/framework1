@@ -20,6 +20,7 @@ import typing
 if not hasattr(typing, "override"):
     typing.override = lambda x=None: x
 sys.modules.setdefault("logly", mock.Mock(logger=mock.Mock()))
+sys.modules.setdefault("flask", mock.Mock(request=mock.Mock(), session=mock.Mock(), flash=mock.Mock(), get_flashed_messages=mock.Mock()))
 
 from cli import database, form_related, migrate, resource_handler, structure
 

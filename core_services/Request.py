@@ -54,15 +54,14 @@ class UploadedFile:
              suffix_separator: str = "",
              keep_name: bool = False, upload_dir=os.getenv("UPLOAD_DIR")):
 
-        if not upload_dir:
-            upload_dir = "uploads"
-        os.makedirs(upload_dir, exist_ok=True)
+        base_dir = upload_dir or os.getenv("UPLOAD_DIR") or "uploads"
+        os.makedirs(base_dir, exist_ok=True)
 
         extension: str = self.extension()
         if keep_name is True:
-            path = upload_dir + "/" + self.file.filename
+            path = base_dir + "/" + self.file.filename
         else:
-            path = upload_dir + "/" + f"{prefix}{prefix_separator}{path or str(uuid.uuid4())}{suffix_separator}{suffix}" + "." + extension
+            path = base_dir + "/" + f"{prefix}{prefix_separator}{path or str(uuid.uuid4())}{suffix_separator}{suffix}" + "." + extension
             path = path.strip()
 
         if path:
@@ -101,14 +100,18 @@ class UploadedFile:
 
 class Request:
     def __init__(self):
+        # Access flask.request via the property; no setup needed
+        if not request:
+            raise RuntimeError("Request helper must be used within a Flask request context.")
         self.request.flash = flash
         self.request.session = session
 
     def __get_json(self):
         content_type = (self.request.content_type or "").lower()
         if content_type.startswith("application/json") or content_type.endswith("+json"):
-            return self.request.json
-        return {}
+            return self.request.get_json(silent=True) or {}
+        # fallback for other content types: try parsing anyway
+        return self.request.get_json(silent=True) or {}
 
     def form(self, group: str) -> dict:
         """

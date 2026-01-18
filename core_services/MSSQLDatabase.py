@@ -64,13 +64,7 @@ class MSSQLDatabase(Database):
         except TypeError:
             self.results = []
         finally:
-            try:
-                if self.cursor:
-                    self.cursor.close()
-                if self.connection:
-                    self.connection.close()
-            except Exception:
-                pass
+            self._cleanup()
         return self.results
 
     def pquery(self, queries, *args):
@@ -118,13 +112,7 @@ class MSSQLDatabase(Database):
             columns = [column[0] for column in cursor.description]
             results_as_tuple.append({keys[key_position]: result_to_dotdict(columns, cursor.fetchall(), self.DotDict)})
             key_position += 1
-        try:
-            if self.cursor:
-                self.cursor.close()
-            if self.connection:
-                self.connection.close()
-        except Exception:
-            pass
+        self._cleanup()
         return results_as_tuple
 
     def save(
@@ -187,3 +175,12 @@ class MSSQLDatabase(Database):
             if inserted_id:
                 return self.query(f"SELECT * FROM [{table}] WHERE [{primary_key}] = ?", inserted_id)[0]
             return None
+
+    def _cleanup(self):
+        try:
+            if getattr(self, "cursor", None):
+                self.cursor.close()
+            if getattr(self, "connection", None):
+                self.connection.close()
+        except Exception:
+            pass
