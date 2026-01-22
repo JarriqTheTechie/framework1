@@ -39,6 +39,7 @@ class SelectField(BaseField):
         if not self.visible:
             return ""
         disabled_attr = " disabled" if self.disabled else ""
+        multiple_attr = ' multiple="multiple"' if str(self.name).endswith("[]") else ""
 
         # Generate HTML for options and optgroups
         options_html = "".join(self._generate_option_html(self.options, value))
@@ -53,7 +54,7 @@ class SelectField(BaseField):
         <select name="{self.name}" 
                 class="{self.class_name}" 
                 {self.explode_data_attributes()} 
-                {disabled_attr}>
+                {disabled_attr}{multiple_attr}>
             {options_html}
         </select>
         {self.render_label(value, record) if self.label_position == "below" else ""}
@@ -61,20 +62,26 @@ class SelectField(BaseField):
         """
 
     def _generate_option_html(self, options, selected_value):
-        normalized_selected = _normalize_for_compare(selected_value)
+        # Support single values and list-like selections
+        selected_set = set()
+        if isinstance(selected_value, (list, tuple, set)):
+            selected_set = {_normalize_for_compare(v) for v in selected_value}
+            normalized_selected = None
+        else:
+            normalized_selected = _normalize_for_compare(selected_value)
 
         for option in options:
             # Plain string
             if isinstance(option, str):
                 val_str = _normalize_for_compare(option)
-                selected = "selected" if val_str == normalized_selected else ""
+                selected = "selected" if val_str == normalized_selected or val_str in selected_set else ""
                 yield f'<option value="{html.escape(val_str)}" {selected}>{option}</option>'
 
             # Tuple (value, label)
             elif isinstance(option, tuple):
                 val, lbl = option
                 val_str = _normalize_for_compare(val)
-                selected = "selected" if val_str == normalized_selected else ""
+                selected = "selected" if val_str == normalized_selected or val_str in selected_set else ""
                 yield f'<option value="{html.escape(val_str)}" {selected}>{lbl}</option>'
 
             # Dict (could be group or simple map)
@@ -85,13 +92,13 @@ class SelectField(BaseField):
                         val = sub.get("value")
                         lbl = sub.get("label", val)
                         val_str = _normalize_for_compare(val)
-                        selected = "selected" if val_str == normalized_selected else ""
+                        selected = "selected" if val_str == normalized_selected or val_str in selected_set else ""
                         group_html += f'<option value="{html.escape(val_str)}" {selected}>{lbl}</option>'
                     group_html += "</optgroup>"
                     yield group_html
                 else:
                     for val, lbl in option.items():
                         val_str = _normalize_for_compare(val)
-                        selected = "selected" if val_str == normalized_selected else ""
+                        selected = "selected" if val_str == normalized_selected or val_str in selected_set else ""
                         yield f'<option value="{html.escape(val_str)}" {selected}>{lbl}</option>'
 

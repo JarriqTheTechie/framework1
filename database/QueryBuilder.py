@@ -598,6 +598,20 @@ class QueryBuilder:
         """
         Remove both LIMIT and OFFSET constraints from the query.
         """
+        # Strip any parameters that were appended for pagination to avoid
+        # leaking them into later update/delete queries when this builder
+        # instance gets reused (e.g., calling update on a record loaded via
+        # `.first()`).
+        pagination_params = 0
+        if self.rows_fetch == "%s" or self.limit_count == "%s":
+            pagination_params += 1
+        if self.offset_count == "%s":
+            pagination_params += 1
+        if pagination_params and len(self.parameters) >= pagination_params:
+            # Pagination params are appended after where/join params, so they
+            # should be at the tail of the list.
+            self.parameters = self.parameters[:-pagination_params]
+
         self.rows_fetch = None
         self.limit_count = None
         self.offset_count = None  # Add this line to clear offset
@@ -1001,8 +1015,15 @@ class QueryBuilder:
         if not values:
             raise ValueError("No update values provided.")
 
-        set_clause = ", ".join(f"{builder._quote_column(k)} = %s" for k in values)
-        set_params = list(values.values())
+        set_parts = []
+        set_params = []
+        for column, value in values.items():
+            if isinstance(value, Raw):
+                set_parts.append(f"{builder._quote_column(column)} = {value.expression}")
+            else:
+                set_parts.append(f"{builder._quote_column(column)} = %s")
+                set_params.append(value)
+        set_clause = ", ".join(set_parts)
 
         where_clause = builder._build_conditions(nested=False)
         if not where_clause:

@@ -25,7 +25,7 @@ load_dotenv()
 p = inflect.engine()
 T = TypeVar("T", bound="ActiveRecord")
 
-from framework1.database.QueryBuilder import QueryBuilder
+from framework1.database.QueryBuilder import QueryBuilder, Raw
 
 from datetime import datetime, date
 
@@ -314,10 +314,18 @@ class ActiveRecord(QueryBuilder, Events,
 
     @dualmethod
     def without_appends(self_or_cls: Self | Type[Self], appends: list[str] = None):
+        """
+        Remove specific appended attributes for this instance/class.
+        - When `appends` is None, all appends are cleared.
+        - When a list is provided, those names are subtracted from the current append set.
+        """
+        base = list(getattr(self_or_cls, "__appends__", []) or [])
         if appends is None:
-            appends = []
-
-        self_or_cls.__appends__ = appends
+            new_appends = []
+        else:
+            new_appends = [a for a in base if a not in appends]
+        # dualmethod clones classes on class-call; scope changes to the clone/instance only.
+        self_or_cls.__appends__ = new_appends
         return self_or_cls
 
     def __getattribute__(self, key) -> Any:
@@ -546,21 +554,29 @@ class ActiveRecord(QueryBuilder, Events,
         self._with_overrides = expand_withs(base + withs)
         return self
 
-    # def with_only(self, withs: list[str]) -> "Self":
-    #     """
-    #     Replace relationships entirely for this instance only.
-    #     """
-    #     self._with_overrides = expand_withs(withs)
-    #     return self
-    @classmethod
-    def with_only(cls, withs: list[str]) -> "Self":
+    @dualmethod
+    def with_only(self_or_cls: Self | Type[Self], withs: list[str]) -> "Self":
         """
         Replace relationships entirely for this instance only.
         """
-        new_class = cls
-        new_class._with_overrides = withs
-        new_class.__with__ = []
-        return new_class
+        normalized = expand_withs(withs)
+        self_or_cls._with_overrides = normalized
+        if isinstance(self_or_cls, type):
+            self_or_cls.__with__ = []
+        return self_or_cls
+
+    def without(self_or_cls: Self | Type[Self], withouts: list[str]) -> "Self":
+        """
+        Remove specific relationships from the preload set for this instance only.
+        Public interface mirrors with_only.
+        """
+        base = getattr(self_or_cls, "_with_overrides", None) or getattr(self_or_cls, "__with__", [])
+        remaining = [w for w in base if w not in withouts]
+        normalized = expand_withs(remaining)
+        self_or_cls._with_overrides = normalized
+        if isinstance(self_or_cls, type):
+            self_or_cls.__with__ = []
+        return self_or_cls
 
     # ---------------------------------------------------------------------------
     # Debugging and introspection
@@ -612,6 +628,86 @@ class ActiveRecord(QueryBuilder, Events,
         sql, params = self.get()
         logger.debug(self.substitute_params(sql, params))
         return self
+
+    def introspect_database_fields(self) -> list[dict[str, Any]]:
+        """
+        Introspect live database columns for this model's table (ignores declared Field attributes).
+        Returns list of dicts: [{"name": ..., "type": ..., "nullable": ..., "default": ...}, ...]
+        """
+        table = self.get_table()
+        driver = (self.__driver__ or "").lower()
+        cursor = None
+
+        try:
+            cursor = self.db.connect()
+
+            if driver == "mysql":
+                schema = getattr(self.db, "connection_dict", {}).get("database")
+                sql = (
+                    "SELECT COLUMN_NAME AS name, DATA_TYPE AS type, "
+                    "IS_NULLABLE AS nullable, COLUMN_DEFAULT AS default_value "
+                    "FROM INFORMATION_SCHEMA.COLUMNS "
+                    "WHERE TABLE_NAME = %s"
+                )
+                params = [table]
+                if schema:
+                    sql += " AND TABLE_SCHEMA = %s"
+                    params.append(schema)
+                cursor.execute(sql, params)
+                rows = cursor.fetchall()
+                return [
+                    {
+                        "name": row[0],
+                        "type": row[1],
+                        "nullable": row[2],
+                        "default": row[3],
+                    }
+                    for row in rows
+                ]
+
+            if driver == "sqlite":
+                cursor.execute(f"PRAGMA table_info({table})")
+                rows = cursor.fetchall()
+                return [
+                    {
+                        "name": row[1],
+                        "type": row[2],
+                        "nullable": row[3] == 0,
+                        "default": row[4],
+                    }
+                    for row in rows
+                ]
+
+            # Default and MSSQL: use INFORMATION_SCHEMA
+            sql = (
+                "SELECT COLUMN_NAME AS name, DATA_TYPE AS type, "
+                "IS_NULLABLE AS nullable, COLUMN_DEFAULT AS default_value "
+                "FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_NAME = ?"
+            )
+            cursor.execute(sql, (table,))
+            rows = cursor.fetchall()
+            return [
+                {
+                    "name": row[0],
+                    "type": row[1],
+                    "nullable": row[2],
+                    "default": row[3],
+                }
+                for row in rows
+            ]
+
+        finally:
+            try:
+                if cursor:
+                    cursor.close()
+            except Exception:
+                pass
+            try:
+                if hasattr(self.db, "_cleanup"):
+                    self.db._cleanup()
+            except Exception:
+                pass
 
     # --------------------------------------------------------------------------
     # Basic Model Information
@@ -759,6 +855,52 @@ class ActiveRecord(QueryBuilder, Events,
     # --------------------------------------------------------------------------
 
     @classmethod
+    def _column_definition(cls, name: str, field: "Field", driver: str) -> tuple[str, bool]:
+        """
+        Build a column definition string for CREATE/ALTER statements.
+        Returns (definition, is_primary_key).
+        """
+        driver = driver.lower()
+        if driver == "mssql":
+            col_def = f"[{name}] {field.get_sql_type()}"
+        else:
+            col_def = f"`{name}` {field.get_sql_type()}"
+
+        if getattr(field, "auto_increment", False):
+            if driver == "mssql":
+                col_def += " IDENTITY(1,1)"
+            else:
+                col_def += " AUTO_INCREMENT"
+
+        if field.collation:
+            col_def += f" COLLATE {field.collation}"
+        if not field.nullable:
+            col_def += " NOT NULL"
+        if field.unique:
+            col_def += " UNIQUE"
+
+        default = getattr(field, "default", None)
+        if default is not None:
+            if isinstance(default, Raw):
+                col_def += f" DEFAULT {default.expression}"
+            elif isinstance(default, str):
+                default_upper = default.upper()
+                if default_upper in ("CURRENT_TIMESTAMP", "NOW()", "GETDATE()"):
+                    col_def += f" DEFAULT {default}"
+                else:
+                    col_def += f" DEFAULT '{default}'"
+            elif isinstance(default, (int, float)):
+                col_def += f" DEFAULT {default}"
+
+        if field.comment:
+            if driver == "mysql":
+                col_def += f" COMMENT '{field.comment}'"
+            else:
+                col_def += f" -- {field.comment}"
+
+        return col_def, getattr(field, "primary_key", False)
+
+    @classmethod
     def generate_schema(cls) -> str:
         fields = cls.get_fields()
         if not fields:
@@ -769,45 +911,8 @@ class ActiveRecord(QueryBuilder, Events,
         driver = getattr(cls, "__driver__", "mysql").lower()
 
         for name, field in fields.items():
-            # Use correct identifier quoting per driver
-            if driver == "mssql":
-                col_def = f"[{name}] {field.get_sql_type()}"
-            else:
-                col_def = f"`{name}` {field.get_sql_type()}"
-
-            # MSSQL: IDENTITY(1,1) instead of AUTO_INCREMENT
-            if getattr(field, "auto_increment", False):
-                if driver == "mssql":
-                    col_def += " IDENTITY(1,1)"
-                else:
-                    col_def += " AUTO_INCREMENT"
-
-            if field.collation:
-                col_def += f" COLLATE {field.collation}"
-            if not field.nullable:
-                col_def += " NOT NULL"
-            if field.unique:
-                col_def += " UNIQUE"
-
-            # Default handling per driver
-            if field.default is not None:
-                if isinstance(field.default, str):
-                    default_upper = field.default.upper()
-                    if default_upper in ("CURRENT_TIMESTAMP", "NOW()", "GETDATE()"):
-                        col_def += f" DEFAULT {field.default}"
-                    else:
-                        col_def += f" DEFAULT '{field.default}'"
-                elif isinstance(field.default, (int, float)):
-                    col_def += f" DEFAULT {field.default}"
-
-            # Comments (MySQL supports COMMENT, MSSQL just ignore/comment out)
-            if field.comment:
-                if driver == "mysql":
-                    col_def += f" COMMENT '{field.comment}'"
-                else:
-                    col_def += f" -- {field.comment}"
-
-            if field.primary_key:
+            col_def, is_pk = cls._column_definition(name, field, driver)
+            if is_pk:
                 pk = name
 
             columns.append(col_def)
@@ -843,7 +948,46 @@ class ActiveRecord(QueryBuilder, Events,
         logger.debug(sql)
         db.query(sql)
         db.connection.commit()
-        print(f"✔ Table `{cls.__table__}` created.")
+        cls.sync_table(db=db)
+        print(f"Table `{cls.__table__}` created.")
+
+    @classmethod
+    def sync_table(cls, db: Database | None = None) -> list[str]:
+        """
+        Ensure newly declared fields are present on the table via ALTER TABLE ADD COLUMN.
+        Returns the executed ALTER statements.
+        """
+        model = cls()
+        if db:
+            model.db = db
+
+        driver = getattr(cls, "__driver__", "mysql").lower()
+        table_name = getattr(cls, "__table__", cls.__name__)
+
+        existing = {col["name"].lower() for col in (model.introspect_database_fields() or [])}
+
+        alters = []
+        for name, field in cls.get_fields().items():
+            if name.lower() in existing:
+                continue
+            if getattr(field, "primary_key", False):
+                # Primary key additions are high risk; require manual migration.
+                continue
+
+            col_def, _ = cls._column_definition(name, field, driver)
+            if driver == "mssql":
+                alters.append(f"ALTER TABLE [{table_name}] ADD {col_def}")
+            else:
+                alters.append(f"ALTER TABLE `{table_name}` ADD COLUMN {col_def}")
+
+        for statement in alters:
+            logger.debug(statement)
+            model.db.query(statement)
+
+        if alters:
+            model.db.connection.commit()
+
+        return alters
 
     # --------------------------------------------------------------------------
     # Migrations
@@ -921,6 +1065,11 @@ class ActiveRecord(QueryBuilder, Events,
         results = []
         for row in rows:
             instance = cls(**row)
+            # propagate any eager-load/appends overrides from the query instance
+            if hasattr(self, "_with_overrides"):
+                instance._with_overrides = getattr(self, "_with_overrides")
+            if hasattr(self, "__appends__"):
+                instance.__appends__ = getattr(self, "__appends__")
             fire_event(event, instance)
             results.append(instance)
         return results
@@ -1086,10 +1235,19 @@ class ActiveRecord(QueryBuilder, Events,
             BulkPreloader(collection, instance=self).run()
 
         results = []
+        pagination_state = {
+            "rows_fetch": getattr(self, "rows_fetch", None),
+            "limit_count": getattr(self, "limit_count", None),
+            "offset_count": getattr(self, "offset_count", None),
+        }
         for record in collection:
             self.fire_event("retrieved", record)
             setattr(record, "conditions", self.conditions)
             setattr(record, "parameters", self.parameters)
+            # Preserve pagination metadata so update/delete can strip stale params
+            setattr(record, "rows_fetch", pagination_state["rows_fetch"])
+            setattr(record, "limit_count", pagination_state["limit_count"])
+            setattr(record, "offset_count", pagination_state["offset_count"])
             results.append(record)
 
         return results[0] if n == 1 else results
@@ -1203,6 +1361,14 @@ class ActiveRecord(QueryBuilder, Events,
         instance.fire_event("saved", instance)
         instance.__original__ = instance.__data__.copy()
 
+        # Reload to capture DB-generated fields (e.g., identity PK)
+        pk_col = instance.get_primary_key_column()
+        pk_val = getattr(instance, pk_col, None)
+        if pk_val:
+            refreshed = instance.clone_without_columns_or_ordering().where(pk_col, pk_val).first()
+            if refreshed:
+                return refreshed
+
         return instance
 
     def save(self, has_triggers=False, is_from_create=False) -> Any:
@@ -1296,11 +1462,18 @@ class ActiveRecord(QueryBuilder, Events,
                                    (last_id,))
                     row = cursor.fetchone()
                 elif self.__driver__ == "mssql":
-                    if not has_triggers:
-                        columns = get_column_names(cursor)  # Get column names
-                        row = result_to_dotdict(columns, [cursor.fetchone()], DataKlass)
-                        last_id = row[0].get(self.get_primary_key_column())
+                    if has_triggers:
+                        row = None
                     else:
+                        row = cursor.fetchone()
+                    last_id = None
+                    if row:
+                        # try attribute (pyodbc.Row) then index 0
+                        if hasattr(row, self.get_primary_key_column()):
+                            last_id = getattr(row, self.get_primary_key_column())
+                        elif len(row):
+                            last_id = row[0]
+                    if not last_id:
                         cursor.execute("SELECT SCOPE_IDENTITY() AS last_id")
                         last_id = cursor.fetchone().last_id
                         cursor.execute(f"SELECT * FROM {self.__table__} WHERE {self.get_primary_key_column()} = ?",
@@ -1311,6 +1484,8 @@ class ActiveRecord(QueryBuilder, Events,
 
                 if last_id:
                     data[pk] = last_id
+                    # keep instance in sync with generated PK
+                    self.__data__[pk] = last_id
                 else:
                     print("Failed to get last insert ID")
                     data[pk] = None
@@ -1397,7 +1572,7 @@ class ActiveRecord(QueryBuilder, Events,
     # --------------------------------------------------------------------------
 
     @override
-    def update(self, values: dict[str, Any]) -> Any:
+    def update(self, values: dict[str, Any] = None, **kwargs) -> Any:
         """
         Update model attributes in the database.
 
@@ -1406,6 +1581,11 @@ class ActiveRecord(QueryBuilder, Events,
         - Bulk update with events.
         - Fast raw bulk update without events.
         """
+        # support both positional dict and kwargs
+        if values is None:
+            values = {}
+        values = {**values, **kwargs}
+
         self.remove_limit()
 
         primary_key = self.get_primary_key_column()

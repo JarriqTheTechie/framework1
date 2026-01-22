@@ -118,6 +118,20 @@ class Form:
             return f'<div class="error-messages mx-2">{error_html}</div>'
         return ""
 
+    def render_non_field_errors(self, field_names: set[str]) -> str:
+        """
+        Render errors that are not tied to a specific field (e.g., form-level validation).
+        """
+        non_field_errors = {k: v for k, v in self.errors.items() if k not in field_names}
+        if not non_field_errors:
+            return ""
+
+        error_html = "".join(
+            "".join(f'<p class="validation-error">{msg}</p>' for msg in messages)
+            for messages in non_field_errors.values()
+        )
+        return f'<div class="error-messages mx-2">{error_html}</div>'
+
     def visible_on(self, boolean: bool) -> 'Form':
         """Set the visibility of the form."""
         self.visible = boolean
@@ -151,6 +165,9 @@ class Form:
 
             loop_counter = 1
             loop_length = 1  # len(self.schema())
+
+            # Collect field names for non-field error rendering
+            field_names = set()
             
             for item in self.schema():
                 if isinstance(item, FieldGroup):
@@ -158,13 +175,21 @@ class Form:
                     html += item.render(self.data, self)
                     if loop_counter == loop_length:
                         pass
+                    for field in item.fields:
+                        try:
+                            field_names.add(field.name)
+                        except Exception:
+                            pass
                 else:
                     value = self.data.get(item.name, "")
+                    field_names.add(item.name)
                     if self.field_type == "checkbox":
                         outer_class = "form-check"
 
                     html += f'  <div class="{outer_class}">{item.render_input(value, item)}{self.render_errors(item.name)}</div>\n'
                 loop_counter += 1
+            # Render any form-level/non-field errors after inputs
+            html += self.render_non_field_errors(field_names)
             html += f'<div style="width: 100%"><button class="{self.submit_button_class}" type="submit" id="{self.__class__.__name__}_btn" style="{self.submit_button_style}">{self.submit_button_text or "Submit"}</button></div>'
             html += f'\n</form>'
         else:

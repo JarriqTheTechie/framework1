@@ -180,7 +180,5 @@ class MSSQLDatabase(Database):
         try:
             if getattr(self, "cursor", None):
                 self.cursor.close()
-            if getattr(self, "connection", None):
-                self.connection.close()
         except Exception:
             pass

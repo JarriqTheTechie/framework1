@@ -98,6 +98,12 @@ class TableRenderMixin:
             if not getattr(field, "_render_html", False):
                 formatted_value = escape(formatted_value)
 
+            # Ensure downstream render logic always works with string-like values
+            if formatted_value is None:
+                formatted_value = ""
+            elif not isinstance(formatted_value, (str, Markup)):
+                formatted_value = str(formatted_value)
+
             content_parts = []
 
             # Handle icon

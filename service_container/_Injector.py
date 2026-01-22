@@ -54,7 +54,17 @@ def injector(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
         sig = inspect.signature(func)
+        parent_class = None
+
+        # Pre-instantiate controller methods so we never miss 'self'
+        if "self" in sig.parameters and "self" not in kwargs and not args:
+            parent_class = get_parent_class(func)
+            if parent_class:
+                args = (parent_class(), *args)
+
         for name, param in sig.parameters.items():
+            if name == "self":
+                continue  # skip injecting self; it's handled above
             if name in kwargs:  # already provided by Flask (e.g. user_id)
                 continue
             service = service_resolver(param, func.__name__)
@@ -65,8 +75,8 @@ def injector(func):
         except Exception as e:
             if "missing 1 required positional argument: 'self'" in str(e):
                 # This is likely a method that needs 'self' injected
-                parent_class = get_parent_class(func)
-                if parent_class:
+                parent_class = parent_class or get_parent_class(func)
+                if parent_class and (not args or not isinstance(args[0], parent_class)):
                     instance = parent_class()
                     return func(instance, *args, **kwargs)
             raise
