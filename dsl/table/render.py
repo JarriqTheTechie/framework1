@@ -15,6 +15,7 @@ class TableRenderMixin:
     def render(self) -> Markup:
         """Generate HTML for the table with improved configurability."""
         request = Request()
+        is_export_mode = bool(getattr(self, "_export_mode", False))
         fields = self._get_schema_cached()
         callable_arity_cache = {}
 
@@ -64,13 +65,14 @@ class TableRenderMixin:
         with profile_component(f"{self.table_name}.resolve_visible_fields", kind="table"):
             fields, toggleable_fields, visible_field_names = resolve_visible_fields(fields)
 
-        has_row_actions = hasattr(self, "has_custom_actions") and self.has_custom_actions()
+        has_row_actions = (not is_export_mode) and hasattr(self, "has_custom_actions") and self.has_custom_actions()
+        is_selectable = bool(getattr(self, "selectable", False)) and (not is_export_mode)
 
         def build_table_header(fields: list[Field]) -> list[str]:
             from urllib.parse import urlencode
 
             header = [f'<thead class="{self.thead_class}"><tr>']
-            if getattr(self, "selectable"):
+            if is_selectable:
                 header.append('<th class="text-center"><input type="checkbox" class="select-all"></th>')
             existing_fields = [f for f in request.input(f"{self.table_name}[sort]", "").split(",") if f]
             existing_dirs = request.input(f"{self.table_name}[sort_dir]", "").split(",")
@@ -271,7 +273,7 @@ class TableRenderMixin:
                     pass
 
                 row = [f'<tr class="{self.tr_class}" {row_dbl_click_action_html}>']
-                if getattr(self, "selectable"):
+                if is_selectable:
                     row.append(
                         f'<td class="text-center"><input type="checkbox" class="row-select" value="{record.get(self.key_id)}"></td>'
                     )
@@ -461,19 +463,19 @@ class TableRenderMixin:
 
         table_actions_header = []
         header_actions = []
-        if hasattr(self, "has_header_actions") and self.has_header_actions():
+        if (not is_export_mode) and hasattr(self, "has_header_actions") and self.has_header_actions():
             try:
                 header_actions = self.get_header_actions() or []
             except Exception:
                 header_actions = []
         bulk_actions = []
-        if hasattr(self, "has_bulk_actions") and self.has_bulk_actions():
+        if (not is_export_mode) and hasattr(self, "has_bulk_actions") and self.has_bulk_actions():
             try:
                 bulk_actions = [a for a in (self.get_bulk_actions() or []) if getattr(a, "scope", "row") == "bulk"]
             except Exception:
                 bulk_actions = []
 
-        if not bool(self.sub_resource_table):
+        if (not is_export_mode) and not bool(self.sub_resource_table):
             table_actions_header.insert(
                 0,
                 render_template_string_safe_internal(
@@ -483,9 +485,21 @@ class TableRenderMixin:
                 ),
             )
 
-        if getattr(self, "model", None) and getattr(self.model, "__exportable__", False):
+        if (not is_export_mode) and getattr(self, "model", None) and getattr(self.model, "__exportable__", False):
             query_args = request.all()
             query_args["table"] = self.__class__.__name__
+            if "chunk" not in query_args:
+                query_args["chunk"] = int(getattr(self, "export_chunk", 200) or 200)
+            if "concurrency" not in query_args:
+                query_args["concurrency"] = int(getattr(self, "export_concurrency", 1) or 1)
+            try:
+                from .export_state import register_export_query
+                export_query = getattr(self, "_export_base_query", None) or getattr(self, "query", None)
+                export_token = register_export_query(self.__class__.__name__, export_query)
+                if export_token:
+                    query_args["__f1_export_token"] = export_token
+            except Exception:
+                pass
             export_url = f"/f1/export-csv-chunked?{__import__('urllib.parse').parse.urlencode(query_args)}"
             table_actions_header.append(
                 f'<a class="btn btn-outline-secondary btn-sm ms-2" href="{export_url}">Export CSV</a>'
@@ -497,7 +511,7 @@ class TableRenderMixin:
                 table_actions_header.append(action.render({}))
 
         # Column visibility picker
-        if toggleable_fields:
+        if (not is_export_mode) and toggleable_fields:
             checkbox_rows = []
             for f in toggleable_fields:
                 checked = "checked" if f.name() in visible_field_names or getattr(f, "_default_visible", True) else ""
@@ -538,7 +552,7 @@ class TableRenderMixin:
             table_actions_header.append(column_picker_html)
 
         # Bulk actions dropdown (requires selectable checkboxes)
-        if bulk_actions and getattr(self, "selectable"):
+        if (not is_export_mode) and bulk_actions and is_selectable:
             bulk_buttons = []
             for action in bulk_actions:
                 action_url = action._resolve_url({})
@@ -594,10 +608,11 @@ class TableRenderMixin:
             """
             table_actions_header.append(bulk_html)
 
-        html.insert(
-            0,
-            f"<div class='table-actions d-inline-flex my-3 justify-content-end'>{''.join(table_actions_header)}</div>",
-        )
+        if not is_export_mode:
+            html.insert(
+                0,
+                f"<div class='table-actions d-inline-flex my-3 justify-content-end'>{''.join(table_actions_header)}</div>",
+            )
 
         with profile_component(f"{self.table_name}.build_table_header", kind="table"):
             html.extend(build_table_header(fields))
@@ -609,11 +624,12 @@ class TableRenderMixin:
                 html.extend(build_table_body(data, fields))
 
         html.append("</table>")
-        with profile_component(f"{self.table_name}.build_pagination", kind="table"):
-            html.extend(build_pagination())
+        if not is_export_mode:
+            with profile_component(f"{self.table_name}.build_pagination", kind="table"):
+                html.extend(build_pagination())
         html.append("</div>")
 
-        if getattr(self, "selectable", False):
+        if is_selectable:
             html.append(
                 f"""
                 <script>
@@ -649,7 +665,7 @@ class TableRenderMixin:
 
         from framework1.dsl.F1TableFilterForm import F1TableFilterForm
 
-        if len(self.filterable_fields) != 0:
+        if (not is_export_mode) and len(self.filterable_fields) != 0:
             with profile_component(f"{self.table_name}.build_filter_bar", kind="table"):
                 filter_form = F1TableFilterForm(request.all()).set_resource_from_table(self)
                 filter_bar_css = render_template_string_safe_internal("table-dsl/filter-bar-styles.html")

@@ -60,6 +60,9 @@ class TableBase:
     filterable_fields = []
     filter_field_meta = {}
     filter_presets = {}
+    # Export tuning defaults (can be overridden per table class)
+    export_chunk = 200
+    export_concurrency = 1
 
     search_placeholder = "Search..."
 

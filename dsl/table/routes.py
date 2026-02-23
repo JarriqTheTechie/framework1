@@ -6,6 +6,8 @@ from pathlib import Path
 from flask import Response
 import io
 import csv
+from html.parser import HTMLParser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from framework1.core_services.Request import Request
 from framework1.service_container._Injector import injectable_route
@@ -58,9 +60,15 @@ def _get_table_registry(force_refresh=False):
 
     for table_cls in tables:
         by_table[table_cls.__name__] = table_cls
-        model_cls = getattr(table_cls, "model", None)
-        if model_cls:
-            by_model[model_cls.__name__] = table_cls
+        model_ref = getattr(table_cls, "model", None)
+        if model_ref:
+            if isinstance(model_ref, type):
+                model_name = model_ref.__name__
+            else:
+                # Some tables assign an ActiveRecord instance to `model`
+                # (for example via configure_export_context). Index by class name.
+                model_name = model_ref.__class__.__name__
+            by_model[model_name] = table_cls
 
     _TABLE_REGISTRY_CACHE = {
         "tables": tables,
@@ -81,6 +89,314 @@ def _resolve_table_class(table_name=None, model_name=None):
     return None
 
 
+class _RenderedTableHtmlParser(HTMLParser):
+    def __init__(self, target_table_id: str = None):
+        super().__init__(convert_charrefs=True)
+        self.target_table_id = target_table_id
+        self.in_table = False
+        self.table_depth = 0
+        self.section = None
+        self.in_row = False
+        self.cell_tag = None
+        self.cell_buffer = []
+        self.current_row = []
+        self.header_rows = []
+        self.body_rows = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs or [])
+        if tag == "table":
+            if not self.in_table:
+                if self.target_table_id and attrs_dict.get("id") != self.target_table_id:
+                    return
+                self.in_table = True
+                self.table_depth = 1
+                return
+            self.table_depth += 1
+            return
+
+        if not self.in_table:
+            return
+
+        if tag in {"thead", "tbody"}:
+            self.section = tag
+            return
+
+        if tag == "tr":
+            self.in_row = True
+            self.current_row = []
+            return
+
+        if self.in_row and tag in {"th", "td"}:
+            self.cell_tag = tag
+            self.cell_buffer = []
+            return
+
+        if self.cell_tag and tag == "br":
+            self.cell_buffer.append("\n")
+
+    def handle_data(self, data):
+        if self.in_table and self.cell_tag:
+            self.cell_buffer.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "table" and self.in_table:
+            self.table_depth -= 1
+            if self.table_depth <= 0:
+                self.in_table = False
+                self.table_depth = 0
+            return
+
+        if not self.in_table:
+            return
+
+        if tag in {"thead", "tbody"}:
+            self.section = None
+            return
+
+        if tag in {"th", "td"} and self.cell_tag == tag:
+            text = "".join(self.cell_buffer)
+            text = " ".join(text.replace("\n", " ").split())
+            self.current_row.append(text)
+            self.cell_tag = None
+            self.cell_buffer = []
+            return
+
+        if tag == "tr" and self.in_row:
+            if self.current_row:
+                target = self.body_rows
+                if self.section == "thead" or any(cell for cell in self.current_row):
+                    if self.section == "thead":
+                        target = self.header_rows
+                target.append(self.current_row)
+            self.current_row = []
+            self.in_row = False
+
+
+def _normalize_tabular_rows(headers: list[str], rows: list[list[str]]) -> tuple[list[str], list[list[str]]]:
+    width = max([len(headers)] + [len(r) for r in rows] + [0])
+    if width == 0:
+        return [], []
+    if not headers:
+        headers = [f"Column {i + 1}" for i in range(width)]
+    elif len(headers) < width:
+        headers = headers + [f"Column {i + 1}" for i in range(len(headers), width)]
+
+    normalized_rows = []
+    for row in rows:
+        if len(row) < width:
+            row = row + [""] * (width - len(row))
+        elif len(row) > width:
+            row = row[:width]
+        normalized_rows.append(row)
+    return headers, normalized_rows
+
+
+def _table_markup_to_csv_bytes(markup, table_id: str) -> bytes:
+    parser = _RenderedTableHtmlParser(target_table_id=table_id)
+    parser.feed(str(markup))
+
+    headers = parser.header_rows[0] if parser.header_rows else []
+    rows = parser.body_rows if parser.body_rows else []
+    if not rows and parser.header_rows[1:]:
+        rows = parser.header_rows[1:]
+    headers, rows = _normalize_tabular_rows(headers, rows)
+
+    out = io.StringIO()
+    writer = csv.writer(out)
+    if headers:
+        writer.writerow(headers)
+    for row in rows:
+        writer.writerow(row)
+    return out.getvalue().encode("utf-8")
+
+
+def _table_markup_to_rows(markup, table_id: str) -> tuple[list[str], list[list[str]]]:
+    parser = _RenderedTableHtmlParser(target_table_id=table_id)
+    parser.feed(str(markup))
+
+    headers = parser.header_rows[0] if parser.header_rows else []
+    rows = parser.body_rows if parser.body_rows else []
+    if not rows and parser.header_rows[1:]:
+        rows = parser.header_rows[1:]
+    headers, rows = _normalize_tabular_rows(headers, rows)
+    return headers, rows
+
+
+def _as_plain_record_list(rows) -> list[dict]:
+    if rows is None:
+        return []
+    if hasattr(rows, "to_list_dict"):
+        try:
+            return rows.to_list_dict()
+        except Exception:
+            pass
+    out = []
+    for row in rows:
+        if isinstance(row, dict):
+            out.append(row)
+        elif hasattr(row, "to_dict"):
+            out.append(row.to_dict())
+        else:
+            try:
+                out.append(dict(row))
+            except Exception:
+                out.append({})
+    return out
+
+
+def _load_table_rows_without_pagination(table) -> list[dict]:
+    query = getattr(table, "query", None)
+    if query is None:
+        return []
+
+    if hasattr(query, "all"):
+        try:
+            return _as_plain_record_list(query.all())
+        except Exception:
+            pass
+
+    if hasattr(query, "db") and hasattr(query, "get"):
+        try:
+            return _as_plain_record_list(query.db.query(*query.get()))
+        except Exception:
+            return []
+
+    return []
+
+
+def _derive_required_relations_from_schema(table) -> list[str]:
+    relations = set()
+    try:
+        fields = table.schema() or []
+    except Exception:
+        fields = []
+
+    for field in fields:
+        name = getattr(field, "name", lambda: "")()
+        text = str(name or "")
+        if "." in text:
+            rel = text.split(".", 1)[0].strip()
+            if rel:
+                relations.add(rel)
+    return sorted(relations)
+
+
+def _optimize_export_query_relations(table):
+    query = getattr(table, "query", None)
+    if not query:
+        return
+
+    explicit_with_only = getattr(table, "export_with_only", None)
+    if explicit_with_only is None:
+        needed_relations = _derive_required_relations_from_schema(table)
+    else:
+        needed_relations = list(explicit_with_only or [])
+
+    explicit_without = list(getattr(table, "export_without", []) or [])
+
+    if hasattr(query, "with_only"):
+        try:
+            query.with_only(needed_relations)
+        except Exception:
+            pass
+    if explicit_without and hasattr(query, "without"):
+        try:
+            query.without(explicit_without)
+        except Exception:
+            pass
+    if hasattr(query, "without_appends"):
+        try:
+            query.without_appends()
+        except Exception:
+            pass
+
+
+def _ensure_export_ordering(query, table):
+    if not getattr(query, "order_by_clauses", None):
+        fallback_order_column = (
+            getattr(getattr(query, "__class__", None), "__primary_key__", None)
+            or getattr(table, "key_id", None)
+            or "id"
+        )
+        try:
+            query = query.order_by(fallback_order_column, "asc")
+        except Exception:
+            pass
+    return query
+
+
+def _paginate_query_rows(query_seed, table, chunk_size: int, workers: int = 1) -> tuple[int, dict[int, list[dict]]]:
+    def fetch_page(page_no: int, count_total: bool = False):
+        q = _ensure_export_ordering(query_seed.clone(), table)
+        page_result = q.paginate(page_no, chunk_size, count_total=count_total)
+        return page_no, page_result, _as_plain_record_list(getattr(page_result, "items", []) or [])
+
+    # Sequential mode: avoid COUNT(*) by walking pages until has_next=False.
+    if workers <= 1:
+        rows_by_page = {}
+        page_no = 1
+        while True:
+            _, page_result, rows = fetch_page(page_no, count_total=False)
+            rows_by_page[page_no] = rows
+            if not getattr(page_result, "has_next", False):
+                break
+            page_no += 1
+        return page_no, rows_by_page
+
+    # Concurrent mode: first page computes total pages, then fan out.
+    _, first_page, first_rows = fetch_page(1, count_total=True)
+    total_pages = int(getattr(first_page, "last_page", 1) or 1)
+    rows_by_page = {1: first_rows}
+
+    if total_pages <= 1:
+        return total_pages, rows_by_page
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        page_numbers = list(range(2, total_pages + 1))
+        futures = {pool.submit(fetch_page, p, False): p for p in page_numbers}
+        for fut in as_completed(futures):
+            p, _, rows = fut.result()
+            rows_by_page[p] = rows
+
+    return total_pages, rows_by_page
+
+
+def _export_table_via_rendered_pages(table_cls, table, chunk_size: int, workers: int = 1) -> bytes:
+    query_seed = getattr(table, "query", None)
+    if query_seed is None or not hasattr(query_seed, "clone"):
+        # Fallback for non-cloneable query objects.
+        table.pagination = None
+        table.data = _load_table_rows_without_pagination(table)
+        return _table_markup_to_csv_bytes(table.render(), table.__class__.__name__)
+
+    total_pages, rows_by_page = _paginate_query_rows(query_seed, table, chunk_size, workers)
+
+    # Reuse the current table instance and swap in page data.
+    render_table = table
+    render_table._export_mode = True
+    headers = []
+    all_rows = []
+    table_id = render_table.__class__.__name__
+
+    for page_no in range(1, total_pages + 1):
+        render_table.pagination = None
+        render_table.data = rows_by_page.get(page_no, [])
+        page_headers, page_rows = _table_markup_to_rows(render_table.render(), table_id)
+        if page_headers and not headers:
+            headers = page_headers
+        all_rows.extend(page_rows)
+
+    headers, all_rows = _normalize_tabular_rows(headers, all_rows)
+    out = io.StringIO()
+    writer = csv.writer(out)
+    if headers:
+        writer.writerow(headers)
+    for row in all_rows:
+        writer.writerow(row)
+    return out.getvalue().encode("utf-8")
+
+
 @injectable_route(app, "/f1/export-csv-chunked", methods=["GET"])
 def TableExportCsvChunked(request: Request):
     """
@@ -91,8 +407,6 @@ def TableExportCsvChunked(request: Request):
     model_name = request.input("model")
     if not table_name and not model_name:
         return {"success": False, "message": "Table or model required"}
-
-    chunk_size = request.integer("chunk", 200)
 
     table_cls = _resolve_table_class(table_name=table_name, model_name=model_name)
 
@@ -115,59 +429,38 @@ def TableExportCsvChunked(request: Request):
     if not table.query:
         return {"success": False, "message": "No query available for export"}
 
-    fields = [
-        f for f in table.schema()
-        if hasattr(f, "_hidden")
-        and not (callable(f._hidden) and f._hidden({}))
-        and not (isinstance(f._hidden, bool) and f._hidden)
-    ]
-    headers = [f.header() for f in fields]
-
-    def value_from_field(field, rec_dict):
-        val = rec_dict
-        if "." in field.name():
-            for part in field.name().split("."):
-                if isinstance(val, dict):
-                    val = val.get(part, "")
-                else:
-                    val = getattr(val, part, "")
-                if val in (None, ""):
-                    break
-        else:
-            val = rec_dict.get(field.name(), "")
-        if hasattr(field, "_format_value"):
-            try:
-                return field._format_value(val, rec_dict)
-            except Exception:
-                # Keep export resilient even when a column formatter depends on
-                # request-only or page-only context that is unavailable in export mode.
-                return val
-        return val
-
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(headers)
-
-    page = 1
-    while True:
+    export_token = request.input("__f1_export_token")
+    if export_token:
         try:
-            pagination = table.query.clone().paginate(page, chunk_size)
+            from .export_state import get_export_query
+            snap_query = get_export_query(export_token, table_cls.__name__)
+            if snap_query is not None:
+                table.query = snap_query
         except Exception:
-            break
+            pass
 
-        items = getattr(pagination, "items", []) or []
-        if not items:
-            break
+    _optimize_export_query_relations(table)
 
-        for rec in items:
-            rec_dict = rec.to_dict() if hasattr(rec, "to_dict") else dict(rec)
-            writer.writerow([value_from_field(f, rec_dict) for f in fields])
+    # Export should represent the rendered DSL using paginated page fetches,
+    # then merge all rendered rows into a single CSV.
+    default_chunk = int(getattr(table, "export_chunk", 200) or 200)
+    default_workers = int(getattr(table, "export_concurrency", 1) or 1)
+    chunk_size = max(1, int(request.integer("chunk", default_chunk) or default_chunk))
+    workers = max(1, min(8, int(request.integer("concurrency", default_workers) or default_workers)))
+    if table.query:
+        try:
+            q = table.query.clone() if hasattr(table.query, "clone") else table.query
+            if hasattr(q, "remove_limit"):
+                q.remove_limit()
+            if hasattr(q, "offset_count"):
+                q.offset_count = None
+            if hasattr(q, "rows_fetch"):
+                q.rows_fetch = None
+            table.query = q
+        except Exception:
+            pass
 
-        if not getattr(pagination, "has_next", False):
-            break
-        page += 1
-
-    csv_bytes = output.getvalue().encode("utf-8")
+    csv_bytes = _export_table_via_rendered_pages(table_cls, table, chunk_size, workers)
     return Response(
         csv_bytes,
         mimetype="text/csv",

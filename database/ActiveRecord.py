@@ -475,10 +475,54 @@ class ActiveRecord(QueryBuilder, Events,
         return self
 
     def clone(self: T) -> T:
+        """
+        Clone query + ActiveRecord-specific runtime overrides.
+        """
         new_instance = self.__class__()
+
+        # Copy core QueryBuilder state.
+        new_instance.__driver__ = self.__driver__
+        new_instance.__table__ = self.__table__
+        new_instance.__primary_key__ = self.__primary_key__
         new_instance.columns = self.columns[:]
         new_instance.conditions = self.conditions[:]
         new_instance.parameters = self.parameters[:]
+        new_instance.order_by_clauses = self.order_by_clauses[:]
+        new_instance.having_conditions = self.having_conditions[:]
+        new_instance.group_by_columns = self.group_by_columns[:]
+        new_instance.joins = self.joins[:]
+        new_instance.ctes = self.ctes[:]
+        new_instance.unions = self.unions[:]
+        new_instance.alias = self.alias
+        new_instance.limit_count = self.limit_count
+        new_instance.offset_count = self.offset_count
+        new_instance.rows_fetch = self.rows_fetch
+        new_instance.distinct_flag = self.distinct_flag
+        new_instance._pagination_param_count = getattr(self, "_pagination_param_count", 0)
+
+        # Preserve runtime relation/appends overrides.
+        if hasattr(self, "_with_overrides"):
+            try:
+                new_instance._with_overrides = list(getattr(self, "_with_overrides") or [])
+            except Exception:
+                new_instance._with_overrides = getattr(self, "_with_overrides")
+        if hasattr(self, "__appends__"):
+            try:
+                new_instance.__appends__ = list(getattr(self, "__appends__") or [])
+            except Exception:
+                new_instance.__appends__ = getattr(self, "__appends__")
+
+        # Preserve misc query execution flags used by read/query paths.
+        for attr in (
+            "__scopes_enabled__",
+            "__projection_include__",
+            "__projection_exclude__",
+            "__optimize_active_record_projection__",
+            "__preload_hint__",
+        ):
+            if hasattr(self, attr):
+                setattr(new_instance, attr, getattr(self, attr))
+
         return new_instance
 
     def _apply_scopes_once_for_read(self):

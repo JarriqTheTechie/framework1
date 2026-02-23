@@ -54,6 +54,15 @@ class TablePaginationMixin:
             page = page or request.integer("page", 1)
             per_page = per_page or request.integer("per_page", 10)
 
+        # Snapshot the pre-pagination query so export can reuse the same
+        # filtered/sorted query builder without page-specific LIMIT/OFFSET.
+        try:
+            self._export_base_query = self.query.clone() if hasattr(self.query, "clone") else self.query
+            if hasattr(self._export_base_query, "remove_limit"):
+                self._export_base_query.remove_limit()
+        except Exception:
+            self._export_base_query = None
+
         # Use the query builder from the model for pagination
         if hasattr(self.query.__class__, "__primary_key__") or getattr(self.query.__class__, "__driver__") == "mssql":
             if not self.query.order_by_clauses:
