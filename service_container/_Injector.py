@@ -102,11 +102,30 @@ def injectable_route(app, route, prefix=None, **options):
         route = f"{prefix}/{route}"
 
     def decorator(func):
-        # print(func.__name__)
-        route_decorator = app.route(route, **options)
-        return route_decorator(
-            injector(func)
-        )
+        injected = injector(func)
+        opts = dict(options)
+        explicit_subdomains = opts.pop("subdomains", None)
+        subdomain_option = opts.get("subdomain")
+
+        # Support multi-subdomain registration while keeping single-subdomain
+        # Flask behavior unchanged for existing call sites.
+        subdomains = explicit_subdomains
+        if subdomains is None and isinstance(subdomain_option, (list, tuple, set)):
+            subdomains = list(subdomain_option)
+            opts.pop("subdomain", None)
+
+        if subdomains is not None:
+            for subdomain in subdomains:
+                per_route_opts = dict(opts)
+                if subdomain is None or str(subdomain).strip() == "":
+                    per_route_opts.pop("subdomain", None)
+                else:
+                    per_route_opts["subdomain"] = str(subdomain).strip()
+                app.route(route, **per_route_opts)(injected)
+            return injected
+
+        route_decorator = app.route(route, **opts)
+        return route_decorator(injected)
 
     return decorator
 

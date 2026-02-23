@@ -9,7 +9,7 @@ from dataclasses import fields, is_dataclass, asdict
 from datetime import datetime, time as dtime, timezone, timedelta
 from secrets import compare_digest
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from zoneinfo import ZoneInfo
 
 from flask import request, flash, session, get_flashed_messages
@@ -648,8 +648,34 @@ class Request:
         session[key] = token
         return token
 
-    def validate_csrf(self, token: str, key="csrf_token") -> bool:
-        return token and compare_digest(session.get(key), token)
+    def _same_origin(self) -> bool:
+        origin = self.request.headers.get("Origin")
+        referer = self.request.headers.get("Referer")
+        host = str(self.request.host or "").strip().lower()
+        if not host:
+            return False
+
+        if origin:
+            parsed = urlparse(origin)
+            origin_host = str(parsed.netloc or "").strip().lower()
+            if origin_host and origin_host != host:
+                return False
+
+        if referer:
+            parsed = urlparse(referer)
+            referer_host = str(parsed.netloc or "").strip().lower()
+            if referer_host and referer_host != host:
+                return False
+
+        return True
+
+    def validate_csrf(self, token: str, key="csrf_token", validate_origin: bool = False) -> bool:
+        valid_token = bool(token) and compare_digest(str(session.get(key, "")), str(token))
+        if not valid_token:
+            return False
+        if validate_origin and not self._same_origin():
+            return False
+        return True
 
     from urllib.parse import urlencode
 

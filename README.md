@@ -98,6 +98,29 @@ Framework1 assumes a **convention-first** layout:
 - Configures Jinja loader + static folder
 - Wires request lifecycle hooks (`before_request`, `after_request`, `teardown_request`)
 - Registers useful Jinja globals/filters
+- Optionally applies host/subdomain config (`server_name`, `subdomain_matching`, `session_cookie_domain`, `preferred_url_scheme`)
+
+Subdomain/local-host routing options can be passed directly:
+
+```python
+Framework1(
+    app,
+    debug=True,
+    server_name="app.localtest.me:8100",
+    subdomain_matching=True,
+    session_cookie_domain=".app.localtest.me",
+    preferred_url_scheme="http",
+)
+```
+
+Or via environment variables:
+
+```
+FRAMEWORK1_SERVER_NAME=app.localtest.me:8100
+FRAMEWORK1_SUBDOMAIN_MATCHING=true
+FRAMEWORK1_SESSION_COOKIE_DOMAIN=.app.localtest.me
+FRAMEWORK1_PREFERRED_URL_SCHEME=http
+```
 
 > You can also manually call `discover_convention_routes(app)` if you prefer the “module with `view()` function” style of routing (see [Handlers & routing](#handlers-controllers-and-routing)).
 

@@ -11,6 +11,7 @@ import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime
+from urllib.parse import urlparse
 
 import click
 import markupsafe
@@ -186,6 +187,121 @@ def _apply_jinja_extensions(app: Flask, extensions):
                 app.logger.debug(f"[Framework1] Failed to add Jinja extension {ext}")
 
 
+def _apply_network_routing_config(app: Flask, **kwargs):
+    """
+    Apply optional Flask host/subdomain routing settings in one place.
+    Supports explicit kwargs first, then environment fallbacks.
+    """
+    server_name = kwargs.get("server_name") or os.getenv("FRAMEWORK1_SERVER_NAME") or os.getenv("SERVER_NAME")
+    preferred_url_scheme = kwargs.get("preferred_url_scheme") or os.getenv("FRAMEWORK1_PREFERRED_URL_SCHEME")
+    session_cookie_domain = kwargs.get("session_cookie_domain") or os.getenv("FRAMEWORK1_SESSION_COOKIE_DOMAIN")
+
+    subdomain_matching = kwargs.get("subdomain_matching")
+    if subdomain_matching is None:
+        env_subdomain_matching = os.getenv("FRAMEWORK1_SUBDOMAIN_MATCHING")
+        if env_subdomain_matching is not None:
+            subdomain_matching = _is_truthy_env(env_subdomain_matching)
+
+    if server_name:
+        app.config["SERVER_NAME"] = server_name
+    if preferred_url_scheme:
+        app.config["PREFERRED_URL_SCHEME"] = preferred_url_scheme
+    if session_cookie_domain:
+        app.config["SESSION_COOKIE_DOMAIN"] = session_cookie_domain
+    if subdomain_matching is not None:
+        app.subdomain_matching = bool(subdomain_matching)
+
+
+def _apply_cookie_security_config(app: Flask, **kwargs):
+    """
+    Apply secure-by-default cookie settings with sensible localhost behavior.
+    """
+    cookie_samesite = kwargs.get("session_cookie_samesite") or os.getenv("FRAMEWORK1_SESSION_COOKIE_SAMESITE")
+    cookie_secure = kwargs.get("session_cookie_secure")
+    if cookie_secure is None:
+        env_secure = os.getenv("FRAMEWORK1_SESSION_COOKIE_SECURE")
+        if env_secure is not None:
+            cookie_secure = _is_truthy_env(env_secure)
+
+    if cookie_samesite:
+        app.config["SESSION_COOKIE_SAMESITE"] = str(cookie_samesite).strip()
+    else:
+        app.config.setdefault("SESSION_COOKIE_SAMESITE", "Lax")
+
+    if cookie_secure is not None:
+        app.config["SESSION_COOKIE_SECURE"] = bool(cookie_secure)
+    else:
+        app.config.setdefault("SESSION_COOKIE_SECURE", False)
+
+    server_name = str(app.config.get("SERVER_NAME", "") or "").split(":")[0].strip().lower()
+    session_cookie_domain = app.config.get("SESSION_COOKIE_DOMAIN")
+    if session_cookie_domain and server_name in {"localhost", "127.0.0.1"}:
+        # Browsers can behave inconsistently with explicit localhost cookie domains.
+        app.config.pop("SESSION_COOKIE_DOMAIN", None)
+
+    # Keep host-only cookies by default for localhost if explicit domain is not provided.
+    if not app.config.get("SESSION_COOKIE_DOMAIN") and server_name in {"localhost", "127.0.0.1"}:
+        app.config["SESSION_COOKIE_DOMAIN"] = None
+
+
+def _apply_proxy_fix(app: Flask, **kwargs):
+    trust_proxy = kwargs.get("trust_proxy")
+    if trust_proxy is None:
+        trust_proxy = _is_truthy_env(os.getenv("FRAMEWORK1_TRUST_PROXY"))
+    if not trust_proxy:
+        return
+
+    x_for = int(os.getenv("FRAMEWORK1_PROXY_X_FOR", kwargs.get("proxy_x_for", 1)))
+    x_proto = int(os.getenv("FRAMEWORK1_PROXY_X_PROTO", kwargs.get("proxy_x_proto", 1)))
+    x_host = int(os.getenv("FRAMEWORK1_PROXY_X_HOST", kwargs.get("proxy_x_host", 1)))
+    x_port = int(os.getenv("FRAMEWORK1_PROXY_X_PORT", kwargs.get("proxy_x_port", 1)))
+    x_prefix = int(os.getenv("FRAMEWORK1_PROXY_X_PREFIX", kwargs.get("proxy_x_prefix", 1)))
+
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(
+        app.wsgi_app,
+        x_for=x_for,
+        x_proto=x_proto,
+        x_host=x_host,
+        x_port=x_port,
+        x_prefix=x_prefix,
+    )
+
+
+def _csrf_exempt_paths() -> set[str]:
+    raw = str(os.getenv("FRAMEWORK1_CSRF_EXEMPT_PATHS", "") or "").strip()
+    paths = set()
+    if not raw:
+        return paths
+    for p in raw.split(","):
+        cleaned = str(p).strip()
+        if cleaned:
+            paths.add(cleaned)
+    return paths
+
+
+def _same_origin_host_check() -> bool:
+    origin = request.headers.get("Origin")
+    referer = request.headers.get("Referer")
+    host = str(request.host or "").strip().lower()
+    if not host:
+        return False
+
+    if origin:
+        parsed = urlparse(origin)
+        origin_host = str(parsed.netloc or "").strip().lower()
+        if origin_host and origin_host != host:
+            return False
+
+    if referer:
+        parsed = urlparse(referer)
+        referer_host = str(parsed.netloc or "").strip().lower()
+        if referer_host and referer_host != host:
+            return False
+
+    return True
+
+
 def _discover_handler_module_paths(handler_roots=None):
     """Yield importable module paths for Python files under handler roots."""
     roots = _expand_paths(handler_roots, "lib/handlers")
@@ -298,10 +414,97 @@ def collect_navigation_items(app: Flask, debug=False):
     return menu_items
 
 
+def _current_request_subdomain(app: Flask) -> str | None:
+    host = str(request.host or "").split(":")[0].strip().lower()
+    server_name = str(app.config.get("SERVER_NAME", "") or "").split(":")[0].strip().lower()
+    if not host or not server_name:
+        return None
+    if host == server_name:
+        return None
+    suffix = f".{server_name}"
+    if not host.endswith(suffix):
+        return None
+    subdomain = host[: -len(suffix)].strip(".")
+    return subdomain or None
+
+
+def _nav_item_allowed_subdomains(item: dict) -> list[str | None] | None:
+    raw = item.get("subdomains")
+    if raw is None and "subdomain" in item:
+        raw = item.get("subdomain")
+    if raw is None:
+        return None
+
+    if isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        values = [raw]
+
+    normalized: list[str | None] = []
+    for value in values:
+        if value is None:
+            normalized.append(None)
+            continue
+        cleaned = str(value).strip()
+        if not cleaned:
+            normalized.append(None)
+            continue
+        normalized.append(cleaned)
+    return normalized
+
+
+def _is_nav_item_visible_for_request(app: Flask, item: dict) -> bool:
+    visible = item.get("visible", True)
+    if callable(visible):
+        try:
+            visible = visible()
+        except Exception:
+            visible = False
+    if not bool(visible):
+        return False
+
+    allowed_subdomains = _nav_item_allowed_subdomains(item)
+    if allowed_subdomains is None:
+        return _current_request_subdomain(app) is None
+
+    current_subdomain = _current_request_subdomain(app)
+    normalized_allowed = []
+    for value in allowed_subdomains:
+        if value == "<subdomain>":
+            normalized_allowed.append(current_subdomain if current_subdomain else "<subdomain>")
+        else:
+            normalized_allowed.append(value)
+    return current_subdomain in normalized_allowed
+
+
+def _navigation_items_for_request(app: Flask, debug=False) -> list[dict]:
+    menu_items = []
+    for controller in app.controllers:
+        if hasattr(controller, "GetNavigation"):
+            try:
+                items = controller.GetNavigation()
+                if isinstance(items, list):
+                    menu_items.extend(items)
+                elif debug:
+                    app.logger.debug(
+                        f"Controller {controller.__class__.__name__} returned non-list navigation items."
+                    )
+            except Exception as e:
+                if debug:
+                    app.logger.debug(f"Error in GetNavigation for {controller.__class__.__name__}: {e}")
+
+    filtered = [item for item in menu_items if _is_nav_item_visible_for_request(app, item)]
+    filtered.sort(key=lambda x: x.get("weight", 100))
+    return filtered
+
+
 def Framework1(app: Flask, debug=False, **kwargs):
     load_dotenv()
     app.secret_key = os.getenv('APP_SECRET_KEY')
     app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 60 * 60 * 24 * 30  # 30 days
+    _apply_network_routing_config(app, **kwargs)
+    _apply_cookie_security_config(app, **kwargs)
+    _apply_proxy_fix(app, **kwargs)
     debug_logging_env = kwargs.get("debug_logging_env", "ORM_DEBUG")
     if debug_logging_env and os.getenv(debug_logging_env, "false").lower() == "true":
         app.logger.setLevel(logging.INFO)
@@ -363,6 +566,10 @@ def Framework1(app: Flask, debug=False, **kwargs):
         if profiler_enabled:
             g._framework1_profile_request_started_at = time.perf_counter()
             g._framework1_profile_spans = []
+
+        if request.method in ("POST", "PUT", "PATCH", "DELETE") and request.path not in _csrf_exempt_paths():
+            if not _same_origin_host_check():
+                return {"success": False, "message": "Cross-origin request blocked"}, 403
 
         skip = request.path.startswith("/static") or request.method not in ("GET", "POST") or request.path.startswith(
             "/resources")
@@ -527,7 +734,7 @@ def Framework1(app: Flask, debug=False, **kwargs):
     @app.context_processor
     def inject_navigation():
         return {
-            'navigation': app.menu_items
+            'navigation': _navigation_items_for_request(app, debug)
         }
 
     @app.cli.command("manage")
