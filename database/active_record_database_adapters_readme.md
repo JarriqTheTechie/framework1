@@ -126,6 +126,7 @@ Under the hood, inserts add `created_at` & `updated_at` timestamps. MySQL uses `
 ```python
 # Find by primary key
 u = User().find(1)              # -> User or None
+u = User().find_many([5, 2, 9]) # -> ModelCollection in requested order
 
 # Find first matching
 u = User().find_by('email', 'ada@example.com')
@@ -257,12 +258,43 @@ class Post(ActiveRecord):
         return self.has_many(Comment, match_on="id", match_with="post_id")
 ```
 
+Optional preload strategy hints per relationship:
+
+```python
+def comments(self):
+    return self.has_many(Comment, "post_id", "id").preload_hint("chunked_in", chunk=500)
+
+def latest_alert(self):
+    return self.has_many(Alert, "payment_id", "id").preload_hint("exists_only")
+```
+
+Supported hints:
+- `in` (default)
+- `chunked_in`
+- `exists_only`
+- `skip`
+
 **Lazy first access, batched subsequent queries**
 
 - The first relationship access runs the minimal query.
 - When serializing many records, the system batches relationship queries per database using `pquery()` for efficiency (see §6 and §10).
 
 > **Note**: Batched serialization infers mapping keys. Ensure your foreign keys follow the conventional pattern you pass into `has_many` / `belongs_to`. If you customize key names heavily, prefer manual composition or single‑record `serialize()` calls.
+
+### Relationship Existence Projection (`with_exists`)
+
+When you only need a boolean flag (instead of preloading full related rows), project an `EXISTS` subquery:
+
+```python
+payments = Payment().with_exists("latest_alert").all()
+# each row has: latest_alert_exists
+
+clients = Client().with_exists(["contacts", "payments"]).paginate(page=1, per_page=50)
+# each row has: contacts_exists, payments_exists
+```
+
+- Works with `has_one`, `has_many`, and `belongs_to`.
+- Reduces memory/query cost compared with loading related records just to test existence.
 
 ---
 
@@ -350,6 +382,8 @@ page.total        # total rows
 page.has_next     # etc.
 page.to_dict()    # JSON‑ready payload
 ```
+
+For high-volume pages where `COUNT(*)` is expensive, callers can use simple pagination behavior at the table layer (`simple_paginate=True`) which skips total-count queries and renders previous/next controls.
 
 - MySQL uses `LIMIT %s OFFSET %s` parameters.
 - MSSQL uses `ORDER BY … OFFSET %s ROWS FETCH NEXT %s ROWS ONLY` and **requires** an `ORDER BY` clause.
@@ -473,6 +507,10 @@ For MSSQL, use the connection obtained via `db.connect()` and call `commit()` / 
 8. **Use events for business invariants, not for heavy I/O.** Keep listeners fast; push slow tasks to queues/background jobs.
 9. **Log and test generated SQL.** `.dump_raw_sql()` is your friend—include it in unit tests for tricky queries.
 10. **Catch **``** where you opt into strict reads.** Return 404s or user‑friendly messages accordingly.
+11. **Tune model read projection intentionally.** Use per-model flags:
+   - `__optimize_active_record_projection__`
+   - `__optimize_preloader_projection__`
+   - `__projection_include__`, `__projection_exclude__`
 
 ---
 
@@ -577,4 +615,3 @@ class Widget(ActiveRecord):
 ## 20) License & Contributions
 
 This module is intended for internal use within Framework1 projects. Contributions via merge requests are welcome—please include unit tests covering SQL generation for both MySQL and MSSQL and verify event firing semantics.
-

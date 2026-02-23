@@ -2,6 +2,7 @@ import logging
 import os
 import pprint
 import types
+import hashlib
 from typing import Protocol
 from flask import session, g, request, has_app_context
 from blinker import Namespace
@@ -37,6 +38,8 @@ class Database(Protocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.logging_enabled = os.getenv("ORM_DEBUG", 'false').lower() == "true"
+        self.slow_query_ms = float(os.getenv("ORM_SLOW_QUERY_MS", "200"))
+        self.log_query_plan = os.getenv("ORM_LOG_QUERY_PLAN", "false").lower() == "true"
         self.logger = logging.getLogger("orm.sql")
         if not self.logger.handlers:  # prevent duplicate handlers
             handler = logging.StreamHandler()
@@ -48,6 +51,8 @@ class Database(Protocol):
 
     def _log_query(self, sql: str, params: tuple, elapsed_ms: float, event_name: str = "sql_query"):
         self.send_query_to_singleton_object(elapsed_ms, params, sql)
+        fingerprint = self._sql_fingerprint(sql)
+        is_slow = elapsed_ms >= self.slow_query_ms
 
         if self.logging_enabled:
             log_entry = {
@@ -56,10 +61,60 @@ class Database(Protocol):
                 "params": params,
                 "elapsed_ms": round(elapsed_ms, 2),
                 "database": self.__class__,
-                "tables": extract_table_names(sql)
+                "tables": extract_table_names(sql),
+                "fingerprint": fingerprint,
+                "slow": is_slow,
             }
             # pretty print dict instead of raw string
             self.logger.debug("\n" + pprint.pformat(log_entry, indent=2, width=80, compact=False) + "\n")
+            if is_slow:
+                slow_entry = {
+                    "event": "sql_slow_query",
+                    "fingerprint": fingerprint,
+                    "elapsed_ms": round(elapsed_ms, 2),
+                    "threshold_ms": self.slow_query_ms,
+                    "tables": extract_table_names(sql),
+                    "database": self.__class__,
+                }
+                self.logger.warning("\n" + pprint.pformat(slow_entry, indent=2, width=80, compact=False) + "\n")
+
+                if self.log_query_plan:
+                    try:
+                        plan = self.explain_sql(sql, params)
+                    except Exception:
+                        plan = None
+                    if plan:
+                        self.logger.warning(
+                            "\n" + pprint.pformat(
+                                {
+                                    "event": "sql_query_plan",
+                                    "fingerprint": fingerprint,
+                                    "plan": plan,
+                                },
+                                indent=2,
+                                width=80,
+                                compact=False,
+                            ) + "\n"
+                        )
+
+    def _normalize_sql_for_fingerprint(self, sql: str) -> str:
+        text = (sql or "").strip().lower()
+        text = re.sub(r"\s+", " ", text)
+        text = re.sub(r"'[^']*'", "?", text)
+        text = re.sub(r"\b\d+\b", "?", text)
+        text = text.replace("?", "%s")
+        return text
+
+    def _sql_fingerprint(self, sql: str) -> str:
+        normalized = self._normalize_sql_for_fingerprint(sql)
+        return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
+
+    def explain_sql(self, sql: str, params: tuple | list | None = None):
+        """
+        Optional DB-specific slow-query plan hook.
+        Subclasses can override.
+        """
+        return None
 
     def send_query_to_singleton_object(self, elapsed_ms, params, sql):
         try:
@@ -70,7 +125,6 @@ class Database(Protocol):
             return
 
         if has_app_context():
-            from framework1 import get_singleton_object
             request_id = request.cookies.get("request_id", "")
 
             if session.get("impersonating"):

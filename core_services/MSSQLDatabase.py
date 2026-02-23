@@ -120,61 +120,74 @@ class MSSQLDatabase(Database):
             table: str,
             data: dict[str, Any],
             where: dict[str, Any] = None,
-            primary_key: str = "id"
+            primary_key: str = "id",
+            refresh: bool = False
     ):
         if not data:
             raise ValueError("No data provided.")
 
         cursor = self.connect()
+        try:
+            if where:
+                # UPDATE logic with WHERE IN support
+                where_clause_parts = []
+                values = []
 
-        if where:
-            # UPDATE logic with WHERE IN support
-            where_clause_parts = []
-            values = []
+                for k, v in where.items():
+                    if isinstance(v, list):  # If the value is a list, use IN clause
+                        where_clause_parts.append(f"[{k}] IN ({','.join(['?'] * len(v))})")
+                        values.extend(v)  # Add all values from the list to the values
+                    else:
+                        where_clause_parts.append(f"[{k}] = ?")
+                        values.append(v)
 
-            for k, v in where.items():
-                if isinstance(v, list):  # If the value is a list, use IN clause
-                    where_clause_parts.append(f"[{k}] IN ({','.join(['?'] * len(v))})")
-                    values.extend(v)  # Add all values from the list to the values
-                else:
-                    where_clause_parts.append(f"[{k}] = ?")
-                    values.append(v)
+                where_clause = " AND ".join(where_clause_parts)
+                set_clause = ", ".join(f"[{k}] = ?" for k in data.keys())
+                sql = f"UPDATE [{table}] SET {set_clause} WHERE {where_clause}"
+                values = tuple(data.values()) + tuple(values)
+                start_time = time.perf_counter()
+                cursor.execute(sql, values)
+                self.connection.commit()
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                self._log_query(sql, values, elapsed_ms)
 
-            where_clause = " AND ".join(where_clause_parts)
-            set_clause = ", ".join(f"[{k}] = ?" for k in data.keys())
-            sql = f"UPDATE [{table}] SET {set_clause} WHERE {where_clause}"
-            values = tuple(data.values()) + tuple(values)
-            start_time = time.perf_counter()
-            cursor.execute(sql, values)
-            self.connection.commit()
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            self._log_query(sql, values, elapsed_ms)
+                if not cursor.rowcount:
+                    return None
+                if refresh:
+                    where_values = []
+                    for value in where.values():
+                        if isinstance(value, list):
+                            where_values.extend(value)
+                        else:
+                            where_values.append(value)
+                    return self.query(f"SELECT * FROM [{table}] WHERE {where_clause}", *where_values)[0]
+                return self.DotDict({**where, **data})
+            else:
+                # INSERT logic
+                fields = ", ".join(f"[{k}]" for k in data.keys())
+                placeholders = ", ".join(["?"] * len(data))
+                values = tuple(data.values())
+                sql = f"INSERT INTO [{table}] ({fields}) VALUES ({placeholders})"
+                start_time = time.perf_counter()
+                cursor.execute(sql, values)
+                self.connection.commit()
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                self._log_query(sql, values, elapsed_ms)
 
-            if cursor.rowcount:
-                where_params = tuple(where.values())
-                select_sql = f"SELECT * FROM [{table}] WHERE {where_clause}"
-                # return self.query(select_sql, *values)[0]
-            return None
-        else:
-            # INSERT logic
-            fields = ", ".join(f"[{k}]" for k in data.keys())
-            placeholders = ", ".join(["?"] * len(data))
-            values = tuple(data.values())
-            sql = f"INSERT INTO [{table}] ({fields}) VALUES ({placeholders})"
-            start_time = time.perf_counter()
-            cursor.execute(sql, values)
-            self.connection.commit()
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            self._log_query(sql, values, elapsed_ms)
+                # Fetch identity from the same connection scope.
+                cursor.execute("SELECT SCOPE_IDENTITY()")
+                identity_row = cursor.fetchone()
+                inserted_id = identity_row[0] if identity_row else None
 
-            # Fetch last inserted row (assumes IDENTITY column is `primary_key`)
-            identity_query = f"SELECT IDENT_CURRENT('{table}') AS [{primary_key}]"
-            identity_result = self.query(identity_query)[0]
-            inserted_id = identity_result[primary_key]
-
-            if inserted_id:
-                return self.query(f"SELECT * FROM [{table}] WHERE [{primary_key}] = ?", inserted_id)[0]
-            return None
+                if not inserted_id:
+                    return None
+                if refresh:
+                    return self.query(f"SELECT * FROM [{table}] WHERE [{primary_key}] = ?", inserted_id)[0]
+                result = dict(data)
+                result[primary_key] = inserted_id
+                return self.DotDict(result)
+        finally:
+            self._cleanup()
 
     def _cleanup(self):
         try:
@@ -182,3 +195,41 @@ class MSSQLDatabase(Database):
                 self.cursor.close()
         except Exception:
             pass
+
+    def explain_sql(self, sql: str, params: tuple | list | None = None):
+        """
+        Returns estimated execution plan rows for MSSQL using SHOWPLAN_XML.
+        Does not execute the target query.
+        """
+        conn = None
+        cur = None
+        try:
+            conn = pyodbc.connect(self.connection_string)
+            cur = conn.cursor()
+            cur.execute("SET SHOWPLAN_XML ON")
+            cur.execute((sql or "").replace("%s", "?"), tuple(params or ()))
+            rows = cur.fetchall() or []
+            plans = []
+            for row in rows:
+                try:
+                    plans.append({"plan_xml": row[0]})
+                except Exception:
+                    plans.append({"plan_xml": str(row)})
+            return plans
+        except Exception:
+            return None
+        finally:
+            try:
+                if cur:
+                    try:
+                        cur.execute("SET SHOWPLAN_XML OFF")
+                    except Exception:
+                        pass
+                    cur.close()
+            except Exception:
+                pass
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass

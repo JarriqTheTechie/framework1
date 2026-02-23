@@ -159,8 +159,16 @@ Create a subclass of `Form` and override `schema()` to return a list of fields a
 - `set_submit_button_text(...)`, `set_submit_button_class(...)`, `set_submit_button_style(...)`
 - `set_form_action(url_or_callable, **kwargs)` — if you pass a Flask view function, the action is resolved via `url_for()`
 - `set_data(dict)` — replace the data backing the form
+- `invalidate_schema_cache()` — clear cached schema metadata for this form instance (usually not needed unless mutating schema-driving state post-init)
+- `set_select_options_loader(loader)` - configure one batched loader for `SelectField` option keys in this form
+- `invalidate_select_options_cache()` - clear cached select-option batches for this form instance
 - `visible_on(bool)` — show/hide the entire form
 - `detect_form_action(data, store_action, update_action)` — automatically choose action/text based on the presence of an id
+
+Runtime note:
+- Form instances cache schema items/flattened field metadata after first access to avoid rebuilding schema repeatedly during `validate()` + `render()`.
+- If a select options loader is configured, each options key is loaded once per form instance and reused for `validate()` + `render()`.
+- Conditional visibility rules are precompiled into a dependency graph once per form instance and emitted on the `<form>` as `data-f1-conditional-graph`.
 
 ### Fields
 
@@ -170,6 +178,7 @@ Every field derives from `BaseField` and supports these fluent setters:
 - CSS & layout: `set_class(...)`, `set_label_class(...)`, `set_style(...)`, `set_outer_class(...)`
 - Attributes: `set_data_attribute(key, value, js_inline=False)`
 - UX & visibility: `set_readonly(True)`, `set_disabled(True)`, `visible_on(bool)`
+- Conditional visibility: `show_when(...)`, `hide_when(...)`, `add_visibility_condition(...)`
 - Value helpers: `default(value)`, `modify_using(callable)`
 - Validation: `is_required(...)`, `min_length(n, ...)`, `max_length(n, ...)`, `pattern(regex, ...)`, `add_validation(fn, message)`
 
@@ -232,6 +241,9 @@ TextareaField("notes").set_label("Notes").set_rows(6).set_class("form-control")
   - `["value1", "value2"]` (value == label)
   - `[{"value": "A", "label": "Option A"}, ...]`
   - Optgroups: `{ "group": "Group label", "options": [{"value": "X", "label": "X"}, ...] }`
+- Optional batched loading:
+  - `.set_options_key("countries")` to tag a field for batched option fetch
+  - `.set_options_transform(fn)` for per-field output shaping after batch load
 
 **Example**
 
@@ -243,6 +255,26 @@ SelectField("country").set_options([
         {"value": "CA", "label": "Canada"},
     ]},
 ])
+```
+
+```python
+class ExampleForm(Form):
+    def __init__(self, data):
+        super().__init__(data)
+        self.set_select_options_loader(self.load_select_options)
+
+    def load_select_options(self, keys, form):
+        out = {}
+        if "countries" in keys:
+            rows = Country().select(["CountryCode", "Name"]).order_by("Name").all()
+            out["countries"] = [{r.CountryCode: r.Name} for r in rows]
+        return out
+
+    def schema(self):
+        return [
+            SelectField("Nationality").set_options_key("countries"),
+            SelectField("Domicile").set_options_key("countries"),
+        ]
 ```
 
 ### CheckboxField
@@ -259,6 +291,7 @@ CheckboxField("topics").set_options([
 ])
 ```
 
+
 > **Note**: For a single boolean toggle, you can still use `CheckboxField` with a single option (you’ll receive a list). Alternatively, prefer a `RadioField` for yes/no.
 
 ### RadioField
@@ -269,6 +302,16 @@ CheckboxField("topics").set_options([
 
 ```python
 RadioField("status").set_options([("active", "Active"), ("inactive", "Inactive")])
+```
+
+```python
+TextField("tax_id")
+    .set_label("Tax ID")
+    .show_when("country", operator="equals", value="US")
+
+TextField("other_country")
+    .set_label("Other Country")
+    .hide_when("country", operator="in", value=["US", "CA"])
 ```
 
 ### RawField
@@ -469,4 +512,3 @@ if __name__ == "__main__":
 ## Changelog expectations
 
 This README reflects the current behavior of the provided classes and is designed to be kept close to the code. If you add new field types or extend `Form.render`, revisit the **Edge cases & notes** section to keep guidance aligned with actual behavior.
-

@@ -460,10 +460,42 @@ class User(ActiveRecord):
 ```python
 User().where("active", 1).order_by("id", "DESC").all()     # → ModelCollection
 User().find(10)                                                # → User | None
+User().find_many([10, 3, 7, 3])                               # → ModelCollection in [10,3,7,3] order
 User().first()                                                 # first by PK
 User().last(5)                                                 # last 5 by PK
 User().paginate(page=1, per_page=20)                           # → PaginationResult
+User().with_exists(["roles", "posts"])                         # adds roles_exists/posts_exists
 ```
+
+### Relationship preload hints
+
+```python
+class Payment(ActiveRecord):
+  def latest_alert(self):
+    return self.has_many(Alert, "payment_id", "id").preload_hint("exists_only")
+
+  def heavy_rel(self):
+    return self.has_many(HeavyRow, "payment_id", "id").preload_hint("chunked_in", chunk=500)
+```
+
+- Optional hints: `in` (default), `chunked_in`, `exists_only`, `skip`.
+- You only set hints for outlier relationships; no hint keeps existing preload behavior.
+
+### ActiveRecord Read Tuning
+
+Per-model knobs:
+
+```python
+class User(ActiveRecord):
+    __optimize_active_record_projection__ = True
+    __optimize_preloader_projection__ = False
+    __projection_include__ = None          # optional whitelist
+    __projection_exclude__ = []            # optional blacklist
+```
+
+- `__optimize_active_record_projection__`: replaces implicit `SELECT *` with safe explicit columns on base reads.
+- `__optimize_preloader_projection__`: enables safer projection in relationship preloads.
+- `__projection_include__` / `__projection_exclude__`: fine-grained auto-select control.
 
 ### Creating & saving
 
@@ -663,4 +695,3 @@ qb = (QueryBuilder().set_driver("mysql").table("payments")
 ## Final notes
 
 Framework1 is intentionally small and pragmatic. If you stick to the patterns above (container for cross‑cutting concerns, `Request` for inputs, QueryBuilder for SQL, ActiveRecord for domain logic), you’ll get a clean, testable codebase with predictable queries across MySQL and MSSQL.
-

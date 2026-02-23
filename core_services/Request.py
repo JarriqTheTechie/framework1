@@ -38,6 +38,8 @@ COMMON_TIME_FORMATS = [
     "%I:%M %p",  # 12-hour time (e.g., 2:30 PM)
 ]
 
+_UNSET = object()
+
 
 def POSTMethod():
     return 'POST'
@@ -101,6 +103,9 @@ class UploadedFile:
 
 
 class Request:
+    _JSON_CACHE_ATTR = "_framework1_cached_json_payload"
+    _ALL_CACHE_ATTR = "_framework1_cached_all_payload"
+
     class _SessionAdapter:
         def __init__(self, backing):
             self._backing = backing
@@ -146,11 +151,27 @@ class Request:
         self.request.session = self._SessionAdapter(session)
 
     def __get_json(self):
+        cached = getattr(self.request, self._JSON_CACHE_ATTR, _UNSET)
+        if cached is not _UNSET:
+            return cached
+
         content_type = (self.request.content_type or "").lower()
         if content_type.startswith("application/json") or content_type.endswith("+json"):
-            return self.request.get_json(silent=True) or {}
-        # fallback for other content types: try parsing anyway
-        return self.request.get_json(silent=True) or {}
+            payload = self.request.get_json(silent=True) or {}
+        else:
+            # fallback for other content types: try parsing anyway
+            payload = self.request.get_json(silent=True) or {}
+
+        setattr(self.request, self._JSON_CACHE_ATTR, payload)
+        return payload
+
+    @staticmethod
+    def _clone_payload(payload: dict) -> dict:
+        # Keep all() behavior non-shared while avoiding expensive rebuilds.
+        return {
+            key: value[:] if isinstance(value, list) else value
+            for key, value in payload.items()
+        }
 
     def form(self, group: str) -> dict:
         """
@@ -184,8 +205,10 @@ class Request:
         elif self.request.method == "POST" and key in self.request.form:
             value = self.request.form[key]
 
-        elif self.request.content_type == 'application/json' and key in self.request.json:
-            value = self.request.json[key]
+        elif self.request.content_type == 'application/json':
+            json_payload = self.__get_json()
+            if isinstance(json_payload, dict) and key in json_payload:
+                value = json_payload[key]
 
         # Nothing found
         if value is None:
@@ -355,6 +378,10 @@ class Request:
         return default
 
     def all(self) -> dict:
+        cached = getattr(self.request, self._ALL_CACHE_ATTR, _UNSET)
+        if cached is not _UNSET:
+            return self._clone_payload(cached)
+
         json_data = self.__get_json() or {}
         data = {}
         for mapping in (self.request.view_args, self.request.args, self.request.form, json_data if isinstance(json_data, dict) else {}):
@@ -373,7 +400,9 @@ class Request:
 
         data.update(list_params)
 
-        return {key: value for key, value in data.items() if value != ''}
+        merged = {key: value for key, value in data.items() if value != ''}
+        setattr(self.request, self._ALL_CACHE_ATTR, merged)
+        return self._clone_payload(merged)
 
     def grouped(self, prefix: str = None, sort: bool = True, as_list: bool = True):
         """

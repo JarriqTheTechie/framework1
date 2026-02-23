@@ -204,13 +204,43 @@ The table renders a small search box. Searching works across:
 
 - Terms are split on spaces and applied with `AND` semantics: each term must match at least one searchable column.
 - Set `persist_search = True` to keep the search string in session across navigation.
+- Search strategy is configurable with `search_mode`:
+  - `contains` (default): `LIKE %term%` (broad match, least index-friendly)
+  - `prefix`: `LIKE term%` (index-friendly on normal btree indexes)
+  - `exact`: `LIKE term` (exact match semantics)
+  - `full_text`: uses `where_full_text` / `or_where_full_text` when the driver supports it; falls back to `contains` otherwise.
+- Use `search_min_term_length` to skip very short tokens (example: `2` to ignore one-character terms).
+- `full_text_mode` is passed through to QueryBuilder full-text mode (for example MySQL `boolean` mode).
 
 ```python
 class PaymentTable(Table):
     search_key = ['id','name','reference']
+    search_mode = 'prefix'
+    search_min_term_length = 2
+    optimize_select_columns = True
     def searchable(self):
         return ['payer_email','payer_account']
 ```
+
+### Select projection (query performance)
+
+By default, tables keep the model/query default projection (often `SELECT *`).
+If you want smaller payloads for wide tables, enable projection pushdown:
+
+```python
+class PaymentTable(Table):
+    optimize_select_columns = True
+
+    def select_columns(self):
+        # Optional extra columns needed by custom actions/formatters
+        return ['reference', 'owner_id']
+```
+
+When enabled, Table DSL auto-selects:
+- `key_id`
+- columns from `schema()`
+- `search_key` + `searchable()` columns
+- any columns returned by `select_columns()`
 
 ---
 
@@ -303,6 +333,75 @@ Call `.paginate(page=None, per_page=None)` on the table. It reads `page`/`per_pa
 PaymentTable().paginate(page=1, per_page=25)
 ```
 
+### Keyset pagination (deep-page performance)
+
+For large tables where deep `OFFSET` becomes slow, use cursor/keyset mode:
+
+```python
+class PaymentTable(Table):
+    pagination_mode = "keyset"
+    keyset_column = "id"          # stable, indexed column
+    keyset_direction = "desc"     # "asc" or "desc"
+    keyset_param = "cursor"       # query key under TableName[cursor]
+```
+
+Notes:
+- Keyset mode is opt-in and leaves existing offset pagination unchanged.
+- Use a stable, indexed sort column (`id`, `created_at`, etc.).
+- Default keyset UI renders `First` and `Next` links (cursor-based).
+
+### Simple pagination (skip COUNT)
+
+If total counts are expensive, you can keep offset paging but skip `COUNT(*)`:
+
+```python
+class PaymentTable(Table):
+    simple_paginate = True
+```
+
+Notes:
+- Renders `Previous`/`Next` controls.
+- Avoids the count query on each page load.
+
+### Index diagnostics
+
+You can inspect whether table-relevant columns are indexed:
+
+```python
+class PaymentTable(Table):
+    validate_indexes = True
+```
+
+When enabled, the table instance exposes `index_validation_report` with:
+- recommended columns (from key/sort/search/filter config)
+- indexed columns (leading and any-position)
+- missing index coverage hints
+- warning flag when `search_mode='contains'` (least index-friendly)
+
+### Join pruning
+
+For tables backed by SQL joins/scopes, you can prune unused joins:
+
+```python
+class SomeTable(Table):
+    optimize_prune_joins = True
+```
+
+When enabled, Table DSL keeps joins referenced by select/order/filter/group/having SQL and removes unreferenced aliases.
+Keep this opt-in, especially for complex queries where joins are intentionally present for side effects.
+
+### ActiveRecord projection flags
+
+Projection optimization is now split by layer (override per model):
+
+```python
+class MyModel(ActiveRecord):
+    __optimize_active_record_projection__ = True     # base find/all/first/paginate reads
+    __optimize_preloader_projection__ = False        # BulkPreloader relationship queries
+```
+
+This allows enabling safer base-read projection while keeping relationship preload projection conservative.
+
 ---
 
 ## Row selection & bulk actions
@@ -310,6 +409,7 @@ PaymentTable().paginate(page=1, per_page=25)
 Set `selectable = True` to render a *select-all* checkbox in the header and one per row. The table will emit checkbox values with the key id (default `'id'`, configurable via `set_key_id('my_pk')`).
 
 A scaffolded `/f1/delete-bulk` endpoint exists; wire it up to your own model mapping and authorization layer before using in production.
+A debug-only `/f1/db/plan-sample` endpoint is available to inspect count/data execution plans for a table query (`table=...`, optional `page`, `per_page`, `mode=count|data|both`).
 
 ```python
 class PaymentTable(Table):
@@ -418,6 +518,8 @@ class UsersTable(Table):
 - `table_class`, `table_style`, `thead_class`, `tbody_class`, `tr_class`.
 - `key_id='id'` → `set_key_id('...')` to change checkbox value key.
 - `search_key` (str or list), `search_placeholder` (str).
+- Search tuning: `search_mode`, `search_min_term_length`, `full_text_mode`.
+- Projection tuning: `optimize_select_columns` (bool), `select_columns() -> list[str]`.
 - `persist_search`, `persist_sort`, `persist_filters` (bool).
 - `selectable` (bool) – toggles row checkboxes.
 - Hooks: `schema()`, `default_sort() -> (field, dir)`, `searchable() -> list[str]`, `filters() -> list[Filter]`, `modify_table_query()` (mutate `self.query` if needed), `record_url(record) -> str`.
@@ -507,4 +609,3 @@ return render_template('index.html', table=PaymentsDashboardTable().paginate())
 ---
 
 That’s the Table DSL: focused, fast, and extensible. Build consistent data grids without sacrificing control over SQL, markup, or UX.
-

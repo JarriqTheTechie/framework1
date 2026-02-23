@@ -1,10 +1,12 @@
 from .core import Table
 from .fields import Field, TextColumn
+from .actions import TableAction
 from .master_detail import MasterDetailRow
 from .routes import TableDeleteBulk, TableExportExcel
 from .utils import record_to_dict
 
 __all__ = [
+    "TableAction",
     "Field",
     "MasterDetailRow",
     "Table",

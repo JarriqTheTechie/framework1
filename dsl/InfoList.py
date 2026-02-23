@@ -8,6 +8,7 @@ from typing import Union, Any, List
 from framework1.utilities.DataKlass import DataKlass
 from markupsafe import Markup
 from typing_extensions import Callable
+from framework1 import profile_component
 
 
 class InfoListField:
@@ -18,6 +19,7 @@ class InfoListField:
         self.__class_name = ""
         self.__label_class_name = ""
         self.__modify_using_ = None
+        self.__modify_using_arity = 2
         self.__value_if_missing = ""
         self._icon_color = ""
         self._icon = None
@@ -29,6 +31,7 @@ class InfoListField:
         self._date_format = None
         self._render_html = False
         self._description = None
+        self._description_arity = 1
         self._description_position = 'below'  # or 'above'
         self._limit = None
         self._limit_end = '...'
@@ -37,9 +40,11 @@ class InfoListField:
         self._sortable = False
         self._searchable = False
         self._tooltip = None
+        self._tooltip_arity = 1
         self._extra_attributes = None
         self._extra_cell_attributes = None
         self._hidden = False
+        self._default_badge_color = None
         if hide_if_empty:
             self.hide_if_empty(default_value)
 
@@ -125,13 +130,19 @@ class InfoListField:
             self._badge_color_map = color
         return self
 
+    def default_badge_color(self, color: str):
+        """
+        Set the fallback badge color used when a color map is provided but
+        the value is not found in the map.
+        """
+        self._default_badge_color = color
+        return self
+
     def modify_using(self, modify_using_: callable):
         from inspect import signature
         sig = signature(modify_using_)
-        if len(sig.parameters) == 1:
-            self.__modify_using_ = lambda value, record=None: modify_using_(value)
-        else:
-            self.__modify_using_ = modify_using_
+        self.__modify_using_arity = len(sig.parameters)
+        self.__modify_using_ = modify_using_
         return self
 
     def default(self, value_if_missing: str):
@@ -143,11 +154,9 @@ class InfoListField:
         if value is None or value == "":
             value = self.__value_if_missing
         if self.__modify_using_:
-            try:
-                return self.__modify_using_(value, record)
-            except TypeError as e:
-                print(str(e))
+            if self.__modify_using_arity == 1:
                 return self.__modify_using_(value)
+            return self.__modify_using_(value, record)
         return value
 
     def date(self, format_string: str = 'M j, Y'):
@@ -231,6 +240,14 @@ class InfoListField:
             raise ValueError("Position must be either 'below' or 'above'")
 
         self._description = description_value
+        if callable(description_value):
+            try:
+                from inspect import signature
+                self._description_arity = len(signature(description_value).parameters)
+            except Exception:
+                self._description_arity = 1
+        else:
+            self._description_arity = 1
         self._description_position = position
         self._description_limit = limit
         self._description_limit_end = end
@@ -282,6 +299,14 @@ class InfoListField:
         - A callable that takes (record) or (record, data) and returns a string
         """
         self._tooltip = text_or_callable
+        if callable(text_or_callable):
+            try:
+                from inspect import signature
+                self._tooltip_arity = len(signature(text_or_callable).parameters)
+            except Exception:
+                self._tooltip_arity = 1
+        else:
+            self._tooltip_arity = 1
         return self
 
     def extra_attributes(self, attrs):
@@ -365,6 +390,91 @@ class InfoList:
         # New grid config
         self._grid_mode = False
         self._grid_columns = 3  # default 3 per row
+        # Per-instance caches for schema/render planning and repeated renders.
+        self._schema_cache = None
+        self._render_plan_cache = None
+        self._render_html_cache = None
+        self._render_html_cache_key = None
+
+    def _compile_render_plan(self, fields: list[InfoListField]):
+        """
+        Precompile per-field access/evaluation functions once per render.
+        This avoids repeating dotted-path parsing and callable branching inside
+        the hot record x field loop.
+        """
+        plan = []
+
+        def _resolve_dotted(record, parts):
+            value = record
+            for part in parts:
+                if isinstance(value, (dict, DataKlass)):
+                    value = value.get(part, "")
+                else:
+                    try:
+                        value = value.get(part, "")
+                    except TypeError:
+                        value = getattr(value, part, "")
+                    except AttributeError:
+                        value = getattr(value, part, "")
+                if not value:
+                    break
+            return value
+
+        for field in fields:
+            field_name = field.name()
+
+            if "." in field_name:
+                parts = tuple(field_name.split("."))
+
+                def value_getter(record, _parts=parts):
+                    return _resolve_dotted(record, _parts)
+            else:
+                def value_getter(record, _field_name=field_name):
+                    try:
+                        return record.get(_field_name, "")
+                    except TypeError:
+                        return getattr(record, _field_name, "")
+                    except AttributeError:
+                        return getattr(record, _field_name, "")
+
+            label = field.header()
+            if callable(label):
+                def label_getter(value, record, _label=label):
+                    return _label(value, record)
+            else:
+                def label_getter(value, record, _label=label):
+                    return _label
+
+            hidden = field._hidden
+            if isinstance(hidden, bool):
+                def hidden_getter(value, record, _hidden=hidden):
+                    return _hidden
+            elif callable(hidden):
+                def hidden_getter(value, record, _hidden=hidden):
+                    return _hidden(value, record)
+            else:
+                def hidden_getter(value, record):
+                    return False
+
+            plan.append(
+                {
+                    "field": field,
+                    "value_getter": value_getter,
+                    "label_getter": label_getter,
+                    "hidden_getter": hidden_getter,
+                }
+            )
+
+        return plan
+
+    def _get_render_plan_cached(self, fields: list[InfoListField]):
+        signature = tuple((id(f), f.name()) for f in fields)
+        cached = self._render_plan_cache
+        if cached and cached.get("signature") == signature:
+            return cached.get("plan", [])
+        plan = self._compile_render_plan(fields)
+        self._render_plan_cache = {"signature": signature, "plan": plan}
+        return plan
 
     def explode_data_attributes(self) -> str:
         """Return all data attributes in HTML format."""
@@ -392,6 +502,70 @@ class InfoList:
 
     def schema(self):
         return []
+
+    def invalidate_schema_cache(self):
+        self._schema_cache = None
+        self._render_plan_cache = None
+        self._render_html_cache = None
+        self._render_html_cache_key = None
+        return self
+
+    def _get_schema_cached(self):
+        if self._schema_cache is None:
+            self._schema_cache = self.schema()
+        return self._schema_cache
+
+    def _record_to_dict(self, record):
+        if isinstance(record, DataKlass):
+            return record.to_dict()
+        if isinstance(record, ActiveRecord):
+            return record.to_dict()
+        if isinstance(record, dict):
+            return record
+        if hasattr(record, "to_dict") and callable(getattr(record, "to_dict")):
+            try:
+                return record.to_dict()
+            except Exception:
+                pass
+        return dict(vars(record)) if hasattr(record, "__dict__") else {}
+
+    def _normalize_record(self, record):
+        if isinstance(record, DataKlass):
+            return record
+        if isinstance(record, ActiveRecord):
+            return DataKlass(record.to_dict())
+        if isinstance(record, dict):
+            return DataKlass(record)
+        if hasattr(record, "to_dict") and callable(getattr(record, "to_dict")):
+            try:
+                return DataKlass(record.to_dict())
+            except Exception:
+                return record
+        return record
+
+    def _compute_render_cache_key(self, data):
+        preview = []
+        for record in data[:8]:
+            rec = self._record_to_dict(record)
+            if "id" in rec:
+                preview.append(("id", rec.get("id")))
+            elif "BusinessPartyId" in rec:
+                preview.append(("BusinessPartyId", rec.get("BusinessPartyId")))
+            else:
+                preview.append(("obj", id(record)))
+        return (
+            len(data),
+            tuple(preview),
+            self._grid_mode,
+            self._grid_columns,
+            self._container_class,
+            self._heading_class,
+            self._footer_class,
+            id(self._heading),
+            id(self._footer),
+            id(self._icon),
+            getattr(self, "_style", ""),
+        )
 
     # --- Grid config ---
     def as_grid(self, columns: int = 3):
@@ -457,7 +631,7 @@ class InfoList:
         if getattr(field, '_icon_map', None) and formatted_value in field._icon_map:
             icon_classes.append(field._icon_map[formatted_value])
         if getattr(field, '_icon', None):
-            icon_classes.append(self._icon)
+            icon_classes.append(field._icon)
         if getattr(field, '_icon_color', None):
             icon_classes.append(field._icon_color)
 
@@ -477,9 +651,7 @@ class InfoList:
         # Description
         if getattr(field, '_description', None):
             if callable(field._description):
-                from inspect import signature
-                sig = signature(field._description)
-                if len(sig.parameters) == 2:
+                if getattr(field, "_description_arity", 1) == 2:
                     description_text = field._description(record, record)
                 else:
                     description_text = field._description(record)
@@ -503,6 +675,11 @@ class InfoList:
                     color_key = formatted_value
                 if color_key:
                     badge_classes.append(f'bg-{field._badge_color_map[color_key]}')
+                elif getattr(field, '_default_badge_color', None):
+                    badge_classes.append(f'bg-{field._default_badge_color}')
+                else:
+                    # Default to primary when using a color map and no explicit match
+                    badge_classes.append('bg-primary')
             elif getattr(field, '_static_badge_color', None):
                 badge_classes.append(f'bg-{field._static_badge_color}')
             content = f'<span class="{" ".join(badge_classes)}">{content}</span>'
@@ -513,7 +690,7 @@ class InfoList:
                 url = field._url_template(record)
             else:
                 try:
-                    url = field._url_template.format(**record.to_dict())
+                    url = field._url_template.format(**self._record_to_dict(record))
                 except KeyError:
                     url = "#"
             content = f'<a href="{url}">{content}</a>'
@@ -524,10 +701,8 @@ class InfoList:
         if getattr(field, '_tooltip', None):
             tooltip = field._tooltip
             if callable(tooltip):
-                from inspect import signature
-                sig = signature(tooltip)
-                if len(sig.parameters) == 2:
-                    tooltip_text = tooltip(record, record.to_dict())
+                if getattr(field, "_tooltip_arity", 1) == 2:
+                    tooltip_text = tooltip(record, self._record_to_dict(record))
                 else:
                     tooltip_text = tooltip(record)
             else:
@@ -551,157 +726,136 @@ class InfoList:
 
     # --- Rendering ---
     def render(self):
-        fields = self.schema()
-        if isinstance(self.data, dict):
-            data = [self.data]
-        elif isinstance(self.data, DataKlass):
-            data = [self.data.to_dict()]
-        elif isinstance(self.data, list):
-            data = self.data
-        elif isinstance(self.data, ActiveRecord):
-            data = [self.data.to_dict()]
-        else:
-            raise Exception(f'{self.data()} is not a valid data type')
+        component_name = self.__class__.__name__
+        with profile_component(f"{component_name}.render.schema", kind="infolist"):
+            fields = self._get_schema_cached()
+            render_plan = self._get_render_plan_cached(fields)
+        with profile_component(f"{component_name}.render.normalize_data", kind="infolist"):
+            if isinstance(self.data, dict):
+                data = [self.data]
+            elif isinstance(self.data, DataKlass):
+                data = [self.data.to_dict()]
+            elif isinstance(self.data, list):
+                data = self.data
+            elif isinstance(self.data, ActiveRecord):
+                data = [self.data.to_dict()]
+            else:
+                raise Exception(f'{self.data()} is not a valid data type')
 
         heading = self._heading(data) if callable(self._heading) else self._heading
         footer = self._footer(data) if callable(self._footer) else self._footer
         icon = self._icon(data) if callable(self._icon) else self._icon
         classes = self._container_class
+        normalized_data = [self._normalize_record(record) for record in data]
+        cache_key = self._compute_render_cache_key(normalized_data)
+        if self._render_html_cache_key == cache_key and self._render_html_cache is not None:
+            return self._render_html_cache
 
         # ───────────────────────────────
         # CLASS-BASED EMPTY STATE SUPPORT
         # ───────────────────────────────
         if not data:
+            with profile_component(f"{component_name}.render.empty_state", kind="infolist"):
             # Detect whether empty() was overridden on the subclass
-            is_overridden = type(self).empty is not InfoList.empty
+                is_overridden = type(self).empty is not InfoList.empty
 
             # If overridden, call subclass implementation
-            if is_overridden:
-                empty_html = self.empty()
-            else:
-                empty_html = None
+                if is_overridden:
+                    empty_html = self.empty()
+                else:
+                    empty_html = None
 
             # Default fallback
-            if not empty_html:
-                empty_html = "<p class=''>No data available.</p>"
+                if not empty_html:
+                    empty_html = "<p class=''>No data available.</p>"
 
             # Resolve dynamic heading, footer, icons
-            heading = self._heading(data) if callable(self._heading) else self._heading
-            footer = self._footer(data) if callable(self._footer) else self._footer
-            icon = self._icon(data) if callable(self._icon) else self._icon
+                heading = self._heading(data) if callable(self._heading) else self._heading
+                footer = self._footer(data) if callable(self._footer) else self._footer
+                icon = self._icon(data) if callable(self._icon) else self._icon
 
-            heading_html = (
-                f"""<div class="card-header bg-white {self._heading_class}">
-                        {f'<i class="{icon} nav_icon"></i>' if icon else ''}
-                        {heading}
-                    </div>"""
-                if heading else ""
-            )
+                heading_html = (
+                    f"""<div class="card-header bg-white {self._heading_class}">
+                            {f'<i class="{icon} nav_icon"></i>' if icon else ''}
+                            {heading}
+                        </div>"""
+                    if heading else ""
+                )
 
-            footer_html = (
-                f"""<div class="card-footer text-muted {self._footer_class}">
-                        {footer}
-                    </div>"""
-                if footer else ""
-            )
+                footer_html = (
+                    f"""<div class="card-footer text-muted {self._footer_class}">
+                            {footer}
+                        </div>"""
+                    if footer else ""
+                )
 
-            return f"""
-                <div class="{self._container_class}" {self.explode_data_attributes()}>
-                    {heading_html}
-                    <div class="card-body text-center py-5">
-                        {empty_html}
+                result = f"""
+                    <div class="{self._container_class}" {self.explode_data_attributes()}>
+                        {heading_html}
+                        <div class="card-body text-center py-5">
+                            {empty_html}
+                        </div>
+                        {footer_html}
                     </div>
-                    {footer_html}
-                </div>
-            """
+                """
+                self._render_html_cache_key = cache_key
+                self._render_html_cache = result
+                return result
 
-        html = f"""
-        <div class="{classes}" style="{self._style if hasattr(self, '_style') else ''}" {self.explode_data_attributes()}>
-            {f'<div class="card-header bg-white {self._heading_class}"><i class="{icon} nav_icon"></i> {heading}</div>' if heading else ''}
-            <div class="card-body">
-        """
+        html_parts = [
+            f'<div class="{classes}" style="{self._style if hasattr(self, "_style") else ""}" {self.explode_data_attributes()}>',
+            f'<div class="card-header bg-white {self._heading_class}"><i class="{icon} nav_icon"></i> {heading}</div>' if heading else '',
+            '<div class="card-body">',
+        ]
 
         # Render content
-        if self._grid_mode:
-            html += '<div class="row g-3">'
-            col_class = f'col-{12 // self._grid_columns}'
-            for record in data:
-                record = DataKlass(record)
-                for field in fields:
-                    if "." in field.name():
-                        # Support nested fields like 'user.name'
-                        parts = field.name().split(".")
-                        value = record
-                        for part in parts:
-                            value = value.get(part, "")
-                            if not value:
-                                break
-                    else:
-                        value = record.get(field.name(), "")
+        with profile_component(f"{component_name}.render.content", kind="infolist"):
+            if self._grid_mode:
+                html_parts.append('<div class="row g-3">')
+                col_class = f'col-{12 // self._grid_columns}'
+                for record in normalized_data:
+                    for item in render_plan:
+                        field = item["field"]
+                        value = item["value_getter"](record)
+                        label_text = item["label_getter"](value, record)
+                        is_hidden = item["hidden_getter"](value, record)
+                        if not is_hidden:
+                            if getattr(field, '_is_separator', False):
+                                html_parts.append("<div class='col-12'><hr class='my-1'></div>")
+                                continue
 
+                        html_parts.append(f"""
+                            <div class="{col_class}">
+                                <div class="fw-bold">{label_text}</div>
+                                <div>{self.build_cell_content(field, value, record)}</div>
+                            </div>
+                        """)
+                html_parts.append('</div>')
+            else:
+                html_parts.append('<div class="row">')
+                for record in normalized_data:
+                    for item in render_plan:
+                        field = item["field"]
+                        value = item["value_getter"](record)
+                        label_text = item["label_getter"](value, record)
+                        is_hidden = item["hidden_getter"](value, record)
+                        if not is_hidden:
+                            if getattr(field, '_is_separator', False):
+                                html_parts.append("<div class='col-12'><hr class='my-3'></div>")
+                                continue
+                            html_parts.append(f"<div class='infolist-label {field.get_label_classes() or self._infolist_label_class_from_field}'>{label_text}</div>")
+                            html_parts.append(f"<div class='infolist-body {field.class_name() or self._infolist_body_class_from_field}'>{self.build_cell_content(field, value, record)}</div>")
+                html_parts.append('</div>')
 
-                    label = field.header()
-                    label_text = label(value, record) if callable(label) else label
-                    if isinstance(field._hidden, bool):
-                        is_hidden = field._hidden
-                    elif callable(field._hidden):
-                        is_hidden = field._hidden(value, record)
-                    if not is_hidden:
-                        if getattr(field, '_is_separator', False):
-                            html += "<div class='col-12'><hr class='my-1'></div>"
-                            continue
-
-                    html += f"""
-                        <div class="{col_class}">
-                            <div class="fw-bold">{label_text}</div>
-                            <div>{self.build_cell_content(field, value, record)}</div>
-                        </div>
-                    """
-            html += '</div>'
-        else:
-            html += '<div class="row">'
-            for record in data:
-                for field in fields:
-                    if "." in field.name():
-                        # Support nested fields like 'user.name'
-                        parts = field.name().split(".")
-                        value = record
-                        for part in parts:
-                            try:
-                                value = value.get(part, "")
-                            except TypeError:
-                                value = getattr(value, part, "")
-                            except AttributeError:
-                                #raise Exception(value(), part)
-                                value = getattr(value, part, "")
-                            if not value:
-                                break
-                    else:
-                        try:
-                            value = record.get(field.name(), "")
-                        except TypeError:
-                            value = getattr(record, field.name(), "")
-
-                    label = field.header()
-                    label_text = label(value, record) if callable(label) else label
-                    if isinstance(field._hidden, bool):
-                        is_hidden = field._hidden
-                    elif callable(field._hidden):
-                        is_hidden = field._hidden(value, record)
-                    if not is_hidden:
-                        if getattr(field, '_is_separator', False):
-                            html += "<div class='col-12'><hr class='my-3'></div>"
-                            continue
-                        html += f"<div class='infolist-label {field.get_label_classes() or self._infolist_label_class_from_field}'>{label_text}</div>"
-                        html += f"<div class='infolist-body {field.class_name() or self._infolist_body_class_from_field}'>{self.build_cell_content(field, value, record)}</div>"
-            html += '</div>'
-
-        html += f"""
-            </div>
-            {f'<div class="card-footer text-muted {self._footer_class}">{footer}</div>' if footer else ''}
-        </div>
-        """
-        return html
+        html_parts.append('</div>')
+        if footer:
+            html_parts.append(f'<div class="card-footer text-muted {self._footer_class}">{footer}</div>')
+        html_parts.append('</div>')
+        with profile_component(f"{component_name}.render.finalize", kind="infolist"):
+            html = "".join(html_parts)
+            self._render_html_cache_key = cache_key
+            self._render_html_cache = html
+            return html
 
     def empty(self) -> str:
         pass

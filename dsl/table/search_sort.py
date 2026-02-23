@@ -1,7 +1,69 @@
 from framework1.core_services.Request import Request
+import re
 
 
 class TableSearchSortMixin:
+    def _extract_join_aliases(self, query) -> set[str]:
+        aliases = set()
+        for join_sql in getattr(query, "joins", []) or []:
+            m = re.search(r"\bJOIN\s+[^\s]+\s+(?:AS\s+)?([A-Za-z_][\w]*)\s+ON\b", str(join_sql), re.IGNORECASE)
+            if m:
+                aliases.add(m.group(1))
+        return aliases
+
+    def _is_column_in_query_scope(self, query, text: str) -> bool:
+        if "." not in text:
+            return True
+        qualifier = text.split(".", 1)[0]
+        base_table = str(getattr(query, "__table__", "") or "")
+        base_alias = str(getattr(query, "alias", "") or "")
+        return qualifier in {base_table, base_alias} or qualifier in self._extract_join_aliases(query)
+
+    def _qualify_column_for_query(self, query, column: str):
+        text = str(column).strip()
+        if not text:
+            return None
+        if "." in text:
+            return text if self._is_column_in_query_scope(query, text) else None
+        if not re.fullmatch(r"[A-Za-z_][\w]*", text):
+            return None
+        table_name = str(getattr(query, "__table__", "") or "")
+        return f"{table_name}.{text}" if table_name else text
+
+    def _resolve_search_mode(self) -> str:
+        mode = str(getattr(self, "search_mode", "contains") or "contains").strip().lower()
+        if mode not in {"contains", "prefix", "exact", "full_text"}:
+            return "contains"
+        return mode
+
+    def _build_like_pattern(self, term: str, mode: str) -> str:
+        if mode == "prefix":
+            return f"{term}%"
+        if mode == "exact":
+            return term
+        return f"%{term}%"
+
+    def _apply_search_term(self, query, searchable_fields: list[str], term: str, mode: str):
+        if mode == "full_text":
+            # Prefer full-text; gracefully fall back if not supported by current driver/query.
+            try:
+                if hasattr(query, "where_full_text"):
+                    if len(searchable_fields) == 1:
+                        return query.where_full_text(
+                            searchable_fields[0], term, getattr(self, "full_text_mode", None)
+                        )
+                    return query.nest(
+                        lambda q: [
+                            q.or_where_full_text(col, term, getattr(self, "full_text_mode", None))
+                            for col in searchable_fields
+                        ]
+                    )
+            except NotImplementedError:
+                pass
+            mode = "contains"
+
+        return query.where_any_columns(searchable_fields, "LIKE", self._build_like_pattern(term, mode))
+
     def _apply_sorting(self, query):
         request = Request()
         session_key = f"{self.__class__.__name__}_sort"
@@ -17,7 +79,7 @@ class TableSearchSortMixin:
             else []
         )
 
-        valid_sort_fields = [f.name() for f in self.schema() if getattr(f, "_sortable", False)]
+        valid_sort_fields = [f.name() for f in self._get_schema_cached() if getattr(f, "_sortable", False)]
         applied_sort = False
 
         # Apply user-provided sort
@@ -26,8 +88,10 @@ class TableSearchSortMixin:
             if field in valid_sort_fields:
                 dir_ = sort_dirs[idx] if idx < len(sort_dirs) else "asc"
                 dir_ = dir_ if dir_ in ["asc", "desc"] else "asc"
-                query = query.order_by(field, dir_)
-                applied_sort = True
+                qualified = self._qualify_column_for_query(query, field)
+                if qualified:
+                    query = query.order_by(qualified, dir_)
+                    applied_sort = True
 
         if applied_sort and self.persist_sort:
             # Save to session
@@ -47,15 +111,19 @@ class TableSearchSortMixin:
                     if field in valid_sort_fields:
                         dir_ = s_dirs[idx] if idx < len(s_dirs) else "asc"
                         dir_ = dir_ if dir_ in ["asc", "desc"] else "asc"
-                        query = query.order_by(field, dir_)
-                        applied_sort = True
+                        qualified = self._qualify_column_for_query(query, field)
+                        if qualified:
+                            query = query.order_by(qualified, dir_)
+                            applied_sort = True
 
         # Fallback to default sort
         if not applied_sort:
             default_field, default_dir = self.default_sort()
             if default_field and default_field in valid_sort_fields:
                 default_dir = default_dir.lower() if default_dir else "asc"
-                query = query.order_by(default_field, default_dir)
+                qualified = self._qualify_column_for_query(query, default_field)
+                if qualified:
+                    query = query.order_by(qualified, default_dir)
 
         return query
 
@@ -84,24 +152,34 @@ class TableSearchSortMixin:
         if hasattr(self, "searchable") and self.searchable.__func__ is not TableSearchSortMixin.searchable:
             method_fields = self.searchable()
 
-        column_fields = [f.name() for f in self.schema() if getattr(f, "_searchable", False)]
+        column_fields = [f.name() for f in self._get_schema_cached() if getattr(f, "_searchable", False)]
         if isinstance(self.search_key, str):
             column_fields.append(self.search_key)
         elif isinstance(self.search_key, list):
             column_fields.extend(self.search_key)
-        searchable_fields = list(dict.fromkeys(method_fields + column_fields))
+        searchable_fields = []
+        for field in list(dict.fromkeys(method_fields + column_fields)):
+            qualified = self._qualify_column_for_query(query, field)
+            if qualified:
+                searchable_fields.append(qualified)
 
         if not searchable_fields:
             return query
 
         # Split search into terms
-        terms = [t.strip() for t in search_term.strip().split() if t.strip()]
+        mode = self._resolve_search_mode()
+        min_term_len = int(getattr(self, "search_min_term_length", 1) or 1)
+        if mode == "exact":
+            terms = [search_term.strip()]
+        else:
+            terms = [t.strip() for t in search_term.strip().split() if t.strip()]
+        terms = [t for t in terms if len(t) >= min_term_len]
         if not terms:
             return query
 
-        # Apply where_any_columns for each term
+        # Apply search term strategy per token
         for term in terms:
-            query = query.where_any_columns(searchable_fields, "LIKE", f"%{term}%")
+            query = self._apply_search_term(query, searchable_fields, term, mode)
 
         return query
 

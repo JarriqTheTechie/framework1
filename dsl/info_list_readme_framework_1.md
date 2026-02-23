@@ -192,9 +192,13 @@ class InvoiceInfo(InfoList):
 - `.set_footer_class(css)` — classes for the footer.
 - `.set_field_infolist_label_classes(css)` — default label column classes (fallback when a field has no `.label_classes()`).
 - `.set_field_infolist_body_classes(css)` — default value column classes (fallback when a field has no `.classes()`).
+- `.invalidate_schema_cache()` - clear cached schema/render-plan/render-output state for this instance.
 - `.render()` — build the HTML string.
 
 \* **Note:** these header/footer/icon helpers are currently presentation-only and accept either a static string or a callable receiving the *data object*.
+
+Runtime note:
+- `InfoList` caches schema metadata, precompiled field render plan, and repeated same-instance render output to reduce per-request Python overhead.
 
 ---
 

@@ -1,4 +1,6 @@
+import json
 import pprint
+import time
 from _collections_abc import Iterable
 
 from framework1.core_services.MSSQLDatabase import result_to_dotdict, get_column_names
@@ -10,7 +12,7 @@ from framework1.core_services.Database import Database
 from framework1.database.BulkPreloader import BulkPreloader
 from framework1.database.Events import Events
 from framework1.database.active_record.utils.ModelCollection import ModelCollection
-from framework1.database.fields.Fields import Field
+from framework1.database.fields.Fields import Field, JsonField, MSSQLJsonField
 from framework1.utilities.DataKlass import DataKlass
 from functools import wraps
 from slugify import slugify
@@ -25,7 +27,8 @@ load_dotenv()
 p = inflect.engine()
 T = TypeVar("T", bound="ActiveRecord")
 
-from framework1.database.QueryBuilder import QueryBuilder, Raw
+from framework1.database.QueryBuilder import QueryBuilder, Raw, count_sql_placeholders
+from framework1.database.schema_cache import get_table_columns_cached
 
 from datetime import datetime, date
 
@@ -249,6 +252,37 @@ class PaginationResult:
         }
 
 
+class SimplePaginationResult:
+    def __init__(self, items, per_page, current_page, has_next: bool):
+        self.items = items
+        self.total = None
+        self.per_page = per_page
+        self.current_page = current_page
+        self.last_page = current_page + (1 if has_next else 0)
+        self._has_next = has_next
+        self.mode = "simple"
+
+    @property
+    def has_next(self):
+        return self._has_next
+
+    @property
+    def has_prev(self):
+        return self.current_page > 1
+
+    def to_dict(self):
+        return {
+            "data": [item.to_dict() for item in self.items],
+            "total": self.total,
+            "per_page": self.per_page,
+            "current_page": self.current_page,
+            "last_page": self.last_page,
+            "has_next": self.has_next,
+            "has_prev": self.has_prev,
+            "mode": self.mode,
+        }
+
+
 class ActiveRecordMeta(type):
     def __init__(cls, name, bases, attrs):
         super().__init__(name, bases, attrs)
@@ -272,6 +306,14 @@ class ActiveRecord(QueryBuilder, Events,
     __abstract__: bool = True
     __appends__: list[str] = []
     __timestamps_disabled__: bool = False
+    # Projection optimization flags (can be overridden per model)
+    __optimize_active_record_projection__: bool = True
+    __optimize_preloader_projection__: bool = False
+    # Projection overrides (optional, per model)
+    # - include: if set, only these columns are eligible for auto-select
+    # - exclude: columns removed from auto-select
+    __projection_include__: list[str] | None = None
+    __projection_exclude__: list[str] = []
 
     # ---------------------------------------------------------------------------
     # Class-level properties
@@ -439,6 +481,58 @@ class ActiveRecord(QueryBuilder, Events,
         new_instance.parameters = self.parameters[:]
         return new_instance
 
+    def _apply_scopes_once_for_read(self):
+        # Read paths call to_sql() later; applying scopes once here keeps
+        # query shape stable and lets us safely inspect joins/projection.
+        if getattr(self, "__scopes_enabled__", False):
+            self.apply_scopes()
+            self.__scopes_enabled__ = False
+        return self
+
+    def _apply_explicit_select_if_safe(self):
+        """
+        Replace implicit SELECT * with explicit model columns when safe.
+        Keep SELECT * for joined queries or when fields are unavailable.
+        """
+        if not getattr(self, "__optimize_active_record_projection__", True):
+            return self
+
+        columns = getattr(self, "columns", None) or []
+        if not (len(columns) == 1 and str(columns[0]).strip() == "*"):
+            return self
+
+        # Joins can change the projection shape; keep wildcard unless caller selected columns.
+        if getattr(self, "joins", None):
+            return self
+
+        db_columns = self._get_db_table_columns_for_projection()
+        if not db_columns:
+            return self
+
+        try:
+            fields = [f for f in self.get_fields().keys() if f in set(db_columns)]
+        except Exception:
+            fields = []
+
+        include = getattr(self, "__projection_include__", None)
+        exclude = set(getattr(self, "__projection_exclude__", []) or [])
+        if include:
+            include_set = set(include)
+            fields = [f for f in fields if f in include_set]
+        if exclude:
+            fields = [f for f in fields if f not in exclude]
+
+        if fields:
+            self.select(fields)
+        return self
+
+    def _get_db_table_columns_for_projection(self):
+        return get_table_columns_cached(
+            db=getattr(self, "db", None),
+            driver=getattr(self, "__driver__", ""),
+            table_raw=getattr(self, "__table__", ""),
+        )
+
     def exists(self) -> bool:
         return bool(self.clone().select_raw("1").limit(1).db.query(*self.get()))
 
@@ -555,7 +649,7 @@ class ActiveRecord(QueryBuilder, Events,
         return self
 
     @dualmethod
-    def with_only(self_or_cls: Self | Type[Self], withs: list[str]) -> "Self":
+    def with_only(self_or_cls: Self | Type[Self], withs: list[str]) -> Self:
         """
         Replace relationships entirely for this instance only.
         """
@@ -565,7 +659,7 @@ class ActiveRecord(QueryBuilder, Events,
             self_or_cls.__with__ = []
         return self_or_cls
 
-    def without(self_or_cls: Self | Type[Self], withouts: list[str]) -> "Self":
+    def without(self_or_cls: Self | Type[Self], withouts: list[str]) -> Self:
         """
         Remove specific relationships from the preload set for this instance only.
         Public interface mirrors with_only.
@@ -577,6 +671,119 @@ class ActiveRecord(QueryBuilder, Events,
         if isinstance(self_or_cls, type):
             self_or_cls.__with__ = []
         return self_or_cls
+
+    def preload_hint(self: T, strategy: str, **options: Any) -> T:
+        """
+        Optional relationship preload strategy hint for BulkPreloader.
+        Supported strategies: in, chunked_in, exists_only, skip
+        """
+        strategy_name = str(strategy or "in").strip().lower()
+        self.__preload_hint__ = {"strategy": strategy_name, **options}
+        return self
+
+    def _table_ref_for_exists(self, query_like, fallback_table: str) -> str:
+        alias = str(getattr(query_like, "alias", "") or "").strip()
+        return alias or fallback_table
+
+    def _strip_relation_value_condition(self, subquery, related_col: str) -> None:
+        """
+        Remove the eager relation's concrete parent-value predicate (e.g. `child.fk = %s`)
+        so it can be replaced by a correlated `where_column(...)`.
+        """
+        conditions = list(getattr(subquery, "conditions", []) or [])
+        params = list(getattr(subquery, "parameters", []) or [])
+        related_leaf = str(related_col).split(".")[-1]
+
+        target_cond_idx = None
+        target_param_start = 0
+        target_param_count = 0
+        param_cursor = 0
+
+        for idx, (_logic, expr) in enumerate(conditions):
+            expr_text = str(expr)
+            ph = count_sql_placeholders(expr_text)
+            if (
+                target_cond_idx is None
+                and ph > 0
+                and "=" in expr_text
+                and (related_col in expr_text or related_leaf in expr_text)
+            ):
+                target_cond_idx = idx
+                target_param_start = param_cursor
+                target_param_count = ph
+                break
+            param_cursor += ph
+
+        if target_cond_idx is not None:
+            conditions.pop(target_cond_idx)
+            if target_param_count > 0:
+                del params[target_param_start:target_param_start + target_param_count]
+            subquery.conditions = conditions
+            subquery.parameters = params
+
+    def with_exists(
+        self: T,
+        relationships: str | list[str],
+        aliases: dict[str, str] | None = None,
+    ) -> T:
+        """
+        Project relationship existence booleans onto the current query.
+
+        Example:
+            Payment().with_exists(["latest_alert"]).all()
+            # => each row has `latest_alert_exists` (0/1 or False/True by driver)
+        """
+        rels = [relationships] if isinstance(relationships, str) else list(relationships or [])
+        aliases = aliases or {}
+        parent_ref = self._table_ref_for_exists(self, self.get_table())
+
+        for rel_name in rels:
+            relation = getattr(self, rel_name, None)
+            if not callable(relation):
+                raise AttributeError(f"Unknown relationship '{rel_name}' on {self.__class__.__name__}.")
+
+            rel_query = relation()
+            if not getattr(rel_query, "__is_relationship__", False):
+                raise ValueError(f"'{rel_name}' is not a preloadable relationship.")
+
+            if getattr(rel_query, "__has_many__", False) or getattr(rel_query, "__has_one__", False):
+                foreign_key = getattr(rel_query, "__foreign_key__", None)
+                owner_key = getattr(rel_query, "__owner_key__", None)
+                if not foreign_key or not owner_key:
+                    raise ValueError(f"Relationship '{rel_name}' is missing key metadata.")
+
+                related_ref = self._table_ref_for_exists(rel_query, rel_query.get_table())
+                related_col = f"{related_ref}.{foreign_key}"
+                parent_col = f"{parent_ref}.{owner_key}"
+            elif getattr(rel_query, "__belongs_to__", False):
+                foreign_key = getattr(rel_query, "__foreign_key__", None)
+                owner_key = getattr(rel_query, "__owner_key__", None)
+                if not foreign_key or not owner_key:
+                    raise ValueError(f"Relationship '{rel_name}' is missing key metadata.")
+
+                related_ref = self._table_ref_for_exists(rel_query, rel_query.get_table())
+                related_col = f"{related_ref}.{owner_key}"
+                parent_col = f"{parent_ref}.{foreign_key}"
+            else:
+                raise NotImplementedError(
+                    f"with_exists currently supports has_one/has_many/belongs_to only ('{rel_name}')."
+                )
+
+            sub = rel_query.clone_without_columns_or_ordering()
+            sub.select_raw("1")
+            sub.remove_ordering()
+            sub.remove_limit()
+            self._strip_relation_value_condition(sub, related_col)
+            sub.where_column(related_col, "=", parent_col)
+
+            alias = aliases.get(rel_name, f"{rel_name}_exists")
+            self.columns.append(
+                f"CASE WHEN EXISTS ({sub.to_sql(include_select=True)}) THEN 1 ELSE 0 END AS {alias}"
+            )
+            # SELECT-subquery bindings must come before outer WHERE bindings.
+            self.parameters = list(sub.parameters) + list(self.parameters)
+
+        return self
 
     # ---------------------------------------------------------------------------
     # Debugging and introspection
@@ -634,6 +841,14 @@ class ActiveRecord(QueryBuilder, Events,
         Introspect live database columns for this model's table (ignores declared Field attributes).
         Returns list of dicts: [{"name": ..., "type": ..., "nullable": ..., "default": ...}, ...]
         """
+        def _row_value(row: Any, index: int, key: str) -> Any:
+            try:
+                return row[index]
+            except (KeyError, IndexError, TypeError):
+                if hasattr(row, "get"):
+                    return row.get(key)
+                return None
+
         table = self.get_table()
         driver = (self.__driver__ or "").lower()
         cursor = None
@@ -657,10 +872,10 @@ class ActiveRecord(QueryBuilder, Events,
                 rows = cursor.fetchall()
                 return [
                     {
-                        "name": row[0],
-                        "type": row[1],
-                        "nullable": row[2],
-                        "default": row[3],
+                        "name": _row_value(row, 0, "name"),
+                        "type": _row_value(row, 1, "type"),
+                        "nullable": _row_value(row, 2, "nullable"),
+                        "default": _row_value(row, 3, "default_value"),
                     }
                     for row in rows
                 ]
@@ -689,10 +904,10 @@ class ActiveRecord(QueryBuilder, Events,
             rows = cursor.fetchall()
             return [
                 {
-                    "name": row[0],
-                    "type": row[1],
-                    "nullable": row[2],
-                    "default": row[3],
+                    "name": _row_value(row, 0, "name"),
+                    "type": _row_value(row, 1, "type"),
+                    "nullable": _row_value(row, 2, "nullable"),
+                    "default": _row_value(row, 3, "default_value"),
                 }
                 for row in rows
             ]
@@ -837,6 +1052,49 @@ class ActiveRecord(QueryBuilder, Events,
         ]
 
     # --------------------------------------------------------------------------
+    # Field Serialization Helpers
+    # --------------------------------------------------------------------------
+
+    def _serialize_fields(self, data: dict[str, Any]) -> dict[str, Any]:
+        """
+        Coerce field values into driver-friendly representations.
+        Currently used to JSON-encode MSSQLJsonField/JsonField values so pyodbc
+        receives strings instead of dict/list objects.
+        """
+        fields = self.get_fields()
+        serialized: dict[str, Any] = {}
+
+        for key, value in data.items():
+            field = fields.get(key)
+            if isinstance(field, (JsonField, MSSQLJsonField)):
+                if value is None:
+                    serialized[key] = None
+                    continue
+
+                obj = value
+                # Allow domain objects to expose serializable payloads
+                if hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
+                    try:
+                        obj = obj.to_dict()
+                    except Exception:
+                        pass
+
+                # Tuples are not JSON-serializable by default
+                if isinstance(obj, tuple):
+                    obj = list(obj)
+
+                if isinstance(obj, (dict, list)):
+                    serialized[key] = json.dumps(obj, default=str)
+                elif isinstance(obj, str):
+                    serialized[key] = obj
+                else:
+                    serialized[key] = json.dumps(obj, default=str)
+            else:
+                serialized[key] = value
+
+        return serialized
+
+    # --------------------------------------------------------------------------
     # Schema Introspection
     # --------------------------------------------------------------------------
 
@@ -946,10 +1204,13 @@ class ActiveRecord(QueryBuilder, Events,
         sql = cls.generate_schema()
         db = cls.__database__()
         logger.debug(sql)
-        db.query(sql)
+        cursor = db.connect()
+        cursor.execute(sql)
         db.connection.commit()
+        if hasattr(db, "_cleanup"):
+            db._cleanup()
         cls.sync_table(db=db)
-        print(f"Table `{cls.__table__}` created.")
+        logger.info(f"Table `{cls.__table__}` created.")
 
     @classmethod
     def sync_table(cls, db: Database | None = None) -> list[str]:
@@ -980,12 +1241,14 @@ class ActiveRecord(QueryBuilder, Events,
             else:
                 alters.append(f"ALTER TABLE `{table_name}` ADD COLUMN {col_def}")
 
-        for statement in alters:
-            logger.debug(statement)
-            model.db.query(statement)
-
         if alters:
+            cursor = model.db.connect()
+            for statement in alters:
+                logger.debug(statement)
+                cursor.execute(statement)
             model.db.connection.commit()
+            if hasattr(model.db, "_cleanup"):
+                model.db._cleanup()
 
         return alters
 
@@ -1058,27 +1321,97 @@ class ActiveRecord(QueryBuilder, Events,
     # Hydration
     # --------------------------------------------------------------------------
 
-    def _hydrate_results(self: T, rows: list[dict], event: str = "retrieved") -> list[T]:
+    def _should_fire_event_during_hydration(self, event: str) -> bool:
+        if event != "retrieved":
+            return True
+
         cls = self.__class__
-        fire_event = self.fire_event
+        has_retrieved_override = getattr(cls, "retrieved", None) is not getattr(Events, "retrieved", None)
+        listeners = cls.__event_listeners__.get(cls, {})
+        has_listeners = bool(listeners.get("retrieved") or listeners.get("__all__"))
+        return has_retrieved_override or has_listeners
+
+    def _hydrate_results(self: T, rows: list[dict], event: str = "retrieved") -> list[T]:
+        if not rows:
+            return []
+
+        should_fire_event = self._should_fire_event_during_hydration(event)
+        has_with_overrides = hasattr(self, "_with_overrides")
+        has_appends = hasattr(self, "__appends__")
+
+        # Fast path: plain model construction only.
+        if not should_fire_event and not has_with_overrides and not has_appends:
+            return [self.__class__(**row) for row in rows]
 
         results = []
         for row in rows:
-            instance = cls(**row)
-            # propagate any eager-load/appends overrides from the query instance
-            if hasattr(self, "_with_overrides"):
+            instance = self.__class__(**row)
+            if has_with_overrides:
                 instance._with_overrides = getattr(self, "_with_overrides")
-            if hasattr(self, "__appends__"):
+            if has_appends:
                 instance.__appends__ = getattr(self, "__appends__")
-            fire_event(event, instance)
+            if should_fire_event:
+                self.fire_event(event, instance)
             results.append(instance)
         return results
+
+    @staticmethod
+    def _freeze_cache_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            return tuple(sorted((k, ActiveRecord._freeze_cache_value(v)) for k, v in value.items()))
+        if isinstance(value, (list, tuple, set)):
+            return tuple(ActiveRecord._freeze_cache_value(v) for v in value)
+        if isinstance(value, (datetime, date)):
+            return value.isoformat()
+        return value
+
+    def _build_find_cache_key(self, query_obj: "ActiveRecord") -> tuple | None:
+        if getattr(self, "__disable_request_find_cache__", False):
+            return None
+        try:
+            sql, params = query_obj.get()
+        except Exception:
+            return None
+        frozen_params = tuple(self._freeze_cache_value(p) for p in (params or ()))
+        return (self.__class__, sql, frozen_params)
+
+    def _get_request_find_cache(self) -> dict:
+        try:
+            from flask import g, has_request_context
+
+            if has_request_context():
+                cache = getattr(g, "_active_record_find_cache", None)
+                if cache is None:
+                    cache = {}
+                    g._active_record_find_cache = cache
+                return cache
+        except Exception:
+            pass
+
+        cache = getattr(self, "_local_find_cache", None)
+        if cache is None:
+            cache = {}
+            self._local_find_cache = cache
+        return cache
+
+    def _clear_request_find_cache(self):
+        try:
+            from flask import g, has_request_context
+
+            if has_request_context() and hasattr(g, "_active_record_find_cache"):
+                g._active_record_find_cache.clear()
+        except Exception:
+            pass
+
+        if hasattr(self, "_local_find_cache"):
+            self._local_find_cache.clear()
 
     # --------------------------------------------------------------------------
     # Retrieval - Bulk
     # --------------------------------------------------------------------------
 
     def all(self: T) -> ModelCollection[T]:
+        self._apply_scopes_once_for_read()._apply_explicit_select_if_safe()
         rows = self.db.query(self)
         collection = ModelCollection(self._hydrate_results(rows))
 
@@ -1104,7 +1437,18 @@ class ActiveRecord(QueryBuilder, Events,
                 .order_by(self.get_primary_key_column(), "asc")
             )
 
-        rows = self.db.query(q)
+        q._apply_scopes_once_for_read()._apply_explicit_select_if_safe()
+
+        cache_key = self._build_find_cache_key(q)
+        rows = None
+        if cache_key is not None:
+            rows = self._get_request_find_cache().get(cache_key)
+        if rows is None:
+            rows = self.db.query(q)
+            if cache_key is not None:
+                self._get_request_find_cache()[cache_key] = list(rows)
+        else:
+            rows = list(rows)
         if not rows:
             return None
 
@@ -1119,6 +1463,65 @@ class ActiveRecord(QueryBuilder, Events,
         setattr(record, "conditions", self.conditions)
         setattr(record, "parameters", self.parameters)
         return record
+
+    def find_many(self: T, ids: list[Any] | tuple[Any, ...]) -> ModelCollection[T]:
+        """
+        Find many records by primary key while preserving input order.
+        Missing IDs are skipped.
+        """
+        from framework1.database.active_record.utils.ModelCollection import ModelCollection
+
+        if ids is None:
+            return ModelCollection([])
+        if not isinstance(ids, (list, tuple)):
+            raise TypeError("ids must be a list or tuple")
+        if not ids:
+            return ModelCollection([])
+
+        pk_col = self.get_primary_key_column()
+        pk_leaf = pk_col.split(".")[-1] if "." in str(pk_col) else str(pk_col)
+
+        # Query unique ids only (fewer bind params), but keep original order for output.
+        unique_ids = []
+        seen = set()
+        for value in ids:
+            marker = str(value)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            unique_ids.append(value)
+
+        q = self.where_in(pk_col, unique_ids)
+        q._apply_scopes_once_for_read()._apply_explicit_select_if_safe()
+        rows = self.db.query(q)
+        if not rows:
+            return ModelCollection([])
+
+        collection = ModelCollection(self._hydrate_results(rows))
+
+        if getattr(self, "__with__", []) or getattr(self, "_with_overrides", None):
+            BulkPreloader(collection, instance=self).run()
+
+        # Build lookup that tolerates type drift (e.g., input "10" vs DB int 10).
+        by_pk = {}
+        for record in collection:
+            value = getattr(record, pk_leaf, None)
+            if value is None and hasattr(record, "__data__"):
+                value = record.__data__.get(pk_leaf)
+            if value is None:
+                continue
+            by_pk.setdefault(value, record)
+            by_pk.setdefault(str(value), record)
+
+        ordered = []
+        for requested in ids:
+            record = by_pk.get(requested)
+            if record is None:
+                record = by_pk.get(str(requested))
+            if record is not None:
+                ordered.append(record)
+
+        return ModelCollection(ordered)
 
     def find_or_fail(self, id: int, throw=None) -> T:
         class RecordNotFound:
@@ -1152,6 +1555,7 @@ class ActiveRecord(QueryBuilder, Events,
         Find a single record by a specific column value.
         """
         q = self.new_query().where(key, "=", value).limit(1)
+        q._apply_scopes_once_for_read()._apply_explicit_select_if_safe()
         rows = self.db.query(q)
         if not rows:
             return None
@@ -1191,15 +1595,11 @@ class ActiveRecord(QueryBuilder, Events,
             if self.__driver__ == "mssql":
                 self.order_by(self.get_primary_key_column())
 
+        self._apply_scopes_once_for_read()._apply_explicit_select_if_safe()
         rows = self.db.query(*self.get())
         if not rows:
             return None
-
-        results = []
-        for row in rows:
-            instance = self.__class__(**row)
-            self.fire_event("retrieved", instance)
-            results.append(instance)
+        results = self._hydrate_results(rows, event="retrieved")
         return results[0] if n == 1 else results
 
     def take_strict(self, n: int = 1) -> T:
@@ -1223,6 +1623,7 @@ class ActiveRecord(QueryBuilder, Events,
         Get the first n records ordered by primary key, with relationship preloading like `find`.
         """
         self.order_by(self.__primary_key__, "asc").limit(n)
+        self._apply_scopes_once_for_read()._apply_explicit_select_if_safe()
         rows = self.db.query(*self.get())
         if not rows:
             return None
@@ -1241,7 +1642,6 @@ class ActiveRecord(QueryBuilder, Events,
             "offset_count": getattr(self, "offset_count", None),
         }
         for record in collection:
-            self.fire_event("retrieved", record)
             setattr(record, "conditions", self.conditions)
             setattr(record, "parameters", self.parameters)
             # Preserve pagination metadata so update/delete can strip stale params
@@ -1270,15 +1670,11 @@ class ActiveRecord(QueryBuilder, Events,
             return self.order_by(self.get_primary_key_column(), "DESC").limit(n)
         else:
             self.order_by(self.get_primary_key_column(), "DESC").limit(n)
+        self._apply_scopes_once_for_read()._apply_explicit_select_if_safe()
         rows = self.db.query(*self.get())
         if not rows:
             return None
-
-        results = []
-        for row in rows:
-            instance = self.__class__(**row)
-            self.fire_event("retrieved", instance)
-            results.append(instance)
+        results = self._hydrate_results(rows, event="retrieved")
 
         return results[0] if n == 1 else results
 
@@ -1299,37 +1695,96 @@ class ActiveRecord(QueryBuilder, Events,
         rows = self.db.query(self)
         return ModelCollection(rows).first()[alias]
 
-    def paginate(self: T, page: int = 1, per_page: int = 10) -> PaginationResult:
+    @staticmethod
+    def _extract_count_value(row: Any) -> int:
+        if hasattr(row, "get"):
+            for key in ("count", "COUNT", "aggregate", "AGGREGATE"):
+                if key in row:
+                    return int(row[key])
+            # case-insensitive fallback
+            lowered = {str(k).lower(): v for k, v in row.items()}
+            if "count" in lowered:
+                return int(lowered["count"])
+        if isinstance(row, dict):
+            for key in ("count", "COUNT", "aggregate", "AGGREGATE"):
+                if key in row:
+                    return int(row[key])
+        raise KeyError("Unable to resolve count column from count query result.")
+
+    def _build_paginate_count_query(self):
+        """
+        Build an exact, minimal count query for pagination.
+        Keeps filtering semantics while stripping expensive read-shape clauses.
+        """
+        count_query = self.clone_without_columns_or_ordering().without_scopes()
+        count_query.columns = [Raw("COUNT(*) as count")]
+        count_query.order_by_clause = None
+        count_query.order_by_clauses = []
+        count_query.limit_count = None
+        count_query.offset_count = None
+        count_query.rows_fetch = None
+
+        # The count query must not re-apply scopes when serialized.
+        if hasattr(count_query, "__scopes_enabled__"):
+            count_query.__scopes_enabled__ = False
+
+        # Keep only bindings referenced by the resulting count SQL.
+        count_sql = count_query.to_sql(include_select=True)
+        placeholder_count = count_sql_placeholders(count_sql)
+        count_query.parameters = list(count_query.parameters[:placeholder_count])
+        return count_query
+
+    def paginate(self: T, page: int = 1, per_page: int = 10, count_total: bool = True) -> PaginationResult:
         from framework1.database.active_record.utils.ModelCollection import ModelCollection
 
         """
         Paginate results with database-level pagination.
         """
+        # Apply scopes once up-front so placeholder order remains stable.
+        # If scopes are applied later during to_sql(), they append WHERE params
+        # after LIMIT/OFFSET params and can break parameter ordering.
+        self._apply_scopes_once_for_read()
+        self._apply_explicit_select_if_safe()
+
         # Reset pagination-related attributes
         self.limit_count = None
         self.offset_count = None
         self.rows_fetch = None
         self.parameters = self.get_parameters()
 
-        # Clone to get total count
-        count_query = self.clone_without_columns_or_ordering().without_scopes()
-        count_query.columns = [f"COUNT(*) as count"]
-        count_query.order_by_clause = None
+        total = None
+        if count_total:
+            count_query = self._build_paginate_count_query()
+            count_rows = self.db.query(count_query)
+            if count_rows:
+                total = self._extract_count_value(count_rows[0])
+            else:
+                total = 0
 
-        try:
-            total = self.db.query(count_query)[0]["count"]
-        except KeyError:
-            total = self.db.query(count_query)[0]["COUNT"]
+        page_size = per_page if count_total else per_page + 1
 
-        # Apply pagination
-        super().paginate(page, per_page).without_scopes()
+        # Apply pagination on the current scoped query.
+        super().paginate(page, page_size)
 
         # Fetch paginated rows
         rows = self.db.query(*self.get())
 
+        has_next = False
+        if not count_total and len(rows) > per_page:
+            has_next = True
+            rows = rows[:per_page]
+
         # Hydrate rows and fire events
         items = ModelCollection(self._hydrate_results(rows))
         BulkPreloader(items).run()
+
+        if not count_total:
+            return SimplePaginationResult(
+                items=items,
+                per_page=per_page,
+                current_page=page,
+                has_next=has_next,
+            )
 
         return PaginationResult(
             items=items,
@@ -1361,14 +1816,6 @@ class ActiveRecord(QueryBuilder, Events,
         instance.fire_event("saved", instance)
         instance.__original__ = instance.__data__.copy()
 
-        # Reload to capture DB-generated fields (e.g., identity PK)
-        pk_col = instance.get_primary_key_column()
-        pk_val = getattr(instance, pk_col, None)
-        if pk_val:
-            refreshed = instance.clone_without_columns_or_ordering().where(pk_col, pk_val).first()
-            if refreshed:
-                return refreshed
-
         return instance
 
     def save(self, has_triggers=False, is_from_create=False) -> Any:
@@ -1391,6 +1838,10 @@ class ActiveRecord(QueryBuilder, Events,
 
         # Drop None and unknown fields
         data = {k: v for k, v in self.__data__.items() if k in fields and v is not None}
+
+        # Ensure JSON fields are serialized for the DB driver (e.g., pyodbc)
+        changed_fields = self._serialize_fields(changed_fields)
+        data = self._serialize_fields(data)
 
         # ---------------------
         # UPDATE PATH
@@ -1423,7 +1874,7 @@ class ActiveRecord(QueryBuilder, Events,
 
             sql, params = builder.update(update_values)
 
-            print(sql, params)
+            logger.debug(f"[UPDATE SQL] {sql} params={params}")
 
             # Ensure parameters are in proper order
             params = list(update_values.values()) + [record_pk]
@@ -1431,6 +1882,7 @@ class ActiveRecord(QueryBuilder, Events,
             # Execute the update
             self.db.query(sql, params)
             self.db.connection.commit()
+            self._clear_request_find_cache()
 
             # Fire after update
             self.fire_event("updated", self)
@@ -1454,40 +1906,33 @@ class ActiveRecord(QueryBuilder, Events,
 
             q = self.insert(data, has_triggers=has_triggers)
             with self.db.connect() as cursor:
-                print(f"Inserting with query: {q}")
+                logger.debug(f"[INSERT SQL] {q}")
                 cursor.execute(*q)
                 if self.__driver__ == "mysql":
                     last_id = cursor.lastrowid
-                    cursor.execute(f"SELECT * FROM {self.__table__} WHERE {self.get_primary_key_column()} = %s",
-                                   (last_id,))
-                    row = cursor.fetchone()
                 elif self.__driver__ == "mssql":
-                    if has_triggers:
-                        row = None
-                    else:
-                        row = cursor.fetchone()
                     last_id = None
-                    if row:
-                        # try attribute (pyodbc.Row) then index 0
-                        if hasattr(row, self.get_primary_key_column()):
-                            last_id = getattr(row, self.get_primary_key_column())
-                        elif len(row):
-                            last_id = row[0]
+                    if not has_triggers:
+                        row = cursor.fetchone()
+                        if row:
+                            # try attribute (pyodbc.Row) then index 0
+                            if hasattr(row, self.get_primary_key_column()):
+                                last_id = getattr(row, self.get_primary_key_column())
+                            elif len(row):
+                                last_id = row[0]
                     if not last_id:
                         cursor.execute("SELECT SCOPE_IDENTITY() AS last_id")
                         last_id = cursor.fetchone().last_id
-                        cursor.execute(f"SELECT * FROM {self.__table__} WHERE {self.get_primary_key_column()} = ?",
-                                       (last_id,))
-                        row = cursor.fetchone()
 
                 self.db.connection.commit()
+                self._clear_request_find_cache()
 
                 if last_id:
                     data[pk] = last_id
                     # keep instance in sync with generated PK
                     self.__data__[pk] = last_id
                 else:
-                    print("Failed to get last insert ID")
+                    logger.warning("Failed to get last insert ID")
                     data[pk] = None
 
             if not getattr(self, "_created_by_create", False):
@@ -1528,9 +1973,8 @@ class ActiveRecord(QueryBuilder, Events,
             instances.append(instance)
 
         # Generate SQL + params
-        sql, params, use_executemany = cls().insert_many(
-            [inst.__data__ for inst in instances], ignore=ignore
-        )
+        serialized_rows = [inst._serialize_fields(inst.__data__) for inst in instances]
+        sql, params, use_executemany = cls().insert_many(serialized_rows, ignore=ignore)
 
         driver = getattr(cls, "__driver__", "mysql")
 
@@ -1565,11 +2009,39 @@ class ActiveRecord(QueryBuilder, Events,
                 connection.rollback()
             raise e
 
+        cls()._clear_request_find_cache()
         return instances
 
     # --------------------------------------------------------------------------
     # Persistence - Update
     # --------------------------------------------------------------------------
+
+    def _execute_write(self, sql: str, params: tuple | list):
+        """
+        Execute a write (insert/update/delete) with logging, commit, and cleanup.
+        Keeps a live connection through commit to avoid MySQL 'server has gone away'
+        when connections are closed before committing.
+        """
+        start_time = time.perf_counter()
+        # Normalize param placeholders for MSSQL/pyodbc which expects '?' markers
+        driver = getattr(self, "__driver__", None)
+        if driver == "mssql":
+            sql = sql.replace("%s", "?")
+
+        cursor = self.db.connect()
+        cursor.execute(sql, params)
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        # Log if available on the db adapter
+        log_fn = getattr(self.db, "_log_query", None)
+        if callable(log_fn):
+            log_fn(sql, params, elapsed_ms)
+        self.db.connection.commit()
+        rowcount = getattr(cursor, "rowcount", 0)
+        cleanup = getattr(self.db, "_cleanup", None)
+        if callable(cleanup):
+            cleanup()
+        self._clear_request_find_cache()
+        return rowcount
 
     @override
     def update(self, values: dict[str, Any] = None, **kwargs) -> Any:
@@ -1604,8 +2076,7 @@ class ActiveRecord(QueryBuilder, Events,
 
             sql, params = super().update(values)
 
-            self.db.query(sql, params)
-            self.db.connection.commit()
+            self._execute_write(sql, params)
 
             self.fire_event("updated", self)
             self.fire_event("saved", self)
@@ -1630,21 +2101,18 @@ class ActiveRecord(QueryBuilder, Events,
 
                 q = self.new_query().where(pk, "=", row[pk]).update(values)
                 sql, params = q
-                self.db.query(sql, params)
-                affected += self.db.cursor.rowcount
+                affected += self._execute_write(sql, params)
 
                 instance.fire_event("updated", instance)
                 instance.fire_event("saved", instance)
 
-            self.db.connection.commit()
             self.__original__ = self.__data__.copy()
             return affected
 
         # Fast bulk update with no events
         else:
             sql, params = super().update(values)
-            self.db.query(sql, params)
-            self.db.connection.commit()
+            self._execute_write(sql, params)
             self.__original__ = self.__data__.copy()
             return True
 
@@ -1682,9 +2150,7 @@ class ActiveRecord(QueryBuilder, Events,
                 inst.fire_event("deleting", inst)
 
         sql, params = super().delete()
-        self.db.query(sql, params)
-        affected_rows = self.db.cursor.rowcount
-        self.db.connection.commit()
+        affected_rows = self._execute_write(sql, params)
 
         # Fire "deleted" events
         if self._with_events and not is_find_based:

@@ -48,6 +48,24 @@
     (function () {
         // -------- Template handling -------------------------------------------------
         let FILTER_ROW_TEMPLATE = null;
+        const FIELD_META = (() => {
+            const el = document.getElementById('filterFieldMeta');
+            if (!el) return {};
+            try { return JSON.parse(el.value || "{}"); } catch (e) { return {}; }
+        })();
+        const PRESETS = (() => {
+            const el = document.getElementById('filterPresets');
+            if (!el) return {};
+            try { return JSON.parse(el.value || "{}"); } catch (e) { return {}; }
+        })();
+
+        const TYPE_OPS = {
+            string: ["where","not_equal","contains","starts_with","ends_with","in","not_in","is_null","is_not_null"],
+            number: ["where","not_equal","greater_than","less_than","greater_than_eq","less_than_eq","between","in","not_in","is_null","is_not_null"],
+            date:   ["where","greater_than","less_than","greater_than_eq","less_than_eq","between","is_null","is_not_null"],
+            datetime: ["where","greater_than","less_than","greater_than_eq","less_than_eq","between","is_null","is_not_null"],
+            timestamp: ["where","greater_than","less_than","greater_than_eq","less_than_eq","between","is_null","is_not_null"]
+        };
 
         function ensureTemplate() {
             if (FILTER_ROW_TEMPLATE) return;
@@ -121,6 +139,8 @@
 
             container.appendChild(row);
             if (opEl) toggleValueInput(opEl);
+            if (fieldEl) restrictOperators(row, fieldEl.value);
+            if (fieldEl && valEl) adjustValueType(valEl, fieldEl.value);
             return row;
         };
 
@@ -142,6 +162,33 @@
                 valueInput.disabled = false;
             }
         };
+
+        function restrictOperators(row, fieldValue) {
+            const opSelect = row.querySelector('select[name="operator[]"]');
+            if (!opSelect) return;
+            const fieldType = FIELD_META[fieldValue] || "string";
+            const allowed = TYPE_OPS[fieldType] || Object.values(TYPE_OPS).flat();
+            Array.from(opSelect.options).forEach(opt => {
+                opt.hidden = !allowed.includes(opt.value);
+                if (opt.hidden && opt.selected) {
+                    // pick first allowed
+                    const first = opSelect.querySelector('option:not([hidden])');
+                    if (first) opSelect.value = first.value;
+                }
+            });
+            toggleValueInput(opSelect);
+        }
+
+        function adjustValueType(input, fieldValue) {
+            const fieldType = FIELD_META[fieldValue] || "string";
+            if (["date","datetime","timestamp"].includes(fieldType)) {
+                input.type = "date";
+            } else if (["number"].includes(fieldType)) {
+                input.type = "number";
+            } else {
+                input.type = "text";
+            }
+        }
 
         // Smoothly remove a filter row
         window.removeFilterRow = function removeFilterRow(el) {
@@ -201,6 +248,27 @@
             const form = document.querySelector('.filterForm');
             if (!form) return;
 
+            // Preset wiring
+            populatePresetSelector();
+            const presetSel = document.getElementById('presetSelector');
+            if (presetSel) {
+                presetSel.addEventListener('change', function () {
+                    const key = this.value;
+                    if (!key || !PRESETS[key]) return;
+                    const container = document.getElementById('filterRows');
+                    container.innerHTML = '';
+                    PRESETS[key].forEach(p => addFilterRow(p));
+                });
+            }
+            const clearBtn = document.getElementById('clearFiltersBtn');
+            if (clearBtn) {
+                clearBtn.addEventListener('click', function () {
+                    const container = document.getElementById('filterRows');
+                    container.innerHTML = '';
+                    addFilterRow();
+                });
+            }
+
             // Reset -> always leave one row
             form.addEventListener('reset', function () {
                 setTimeout(() => {
@@ -255,6 +323,23 @@
                 if (e.target && e.target.matches('select[name="operator[]"]')) {
                     toggleValueInput(e.target);
                 }
+                if (e.target && e.target.matches('select[name="field[]"]')) {
+                    const row = e.target.closest('.filter-row');
+                    const val = row?.querySelector('input[name="value[]"]');
+                    restrictOperators(row, e.target.value);
+                    if (val) adjustValueType(val, e.target.value);
+                }
+            });
+        }
+
+        function populatePresetSelector() {
+            const sel = document.getElementById('presetSelector');
+            if (!sel) return;
+            Object.entries(PRESETS).forEach(([key, filters]) => {
+                const opt = document.createElement('option');
+                opt.value = key;
+                opt.textContent = key;
+                sel.appendChild(opt);
             });
         }
 

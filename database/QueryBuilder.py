@@ -23,6 +23,151 @@ def is_active_record_or_active_record_query(obj: Any) -> bool:
     return isinstance(obj, QueryBuilder) or isinstance(obj, ActiveRecord)
 
 
+def count_sql_placeholders(sql: str) -> int:
+    """
+    Count SQL bind placeholders while ignoring quoted string literals.
+    Supports `%s` and `?`.
+    """
+    if not sql:
+        return 0
+
+    in_single = False
+    in_double = False
+    i = 0
+    count = 0
+    n = len(sql)
+
+    while i < n:
+        ch = sql[i]
+
+        # Handle single-quoted string with escaped ''.
+        if in_single:
+            if ch == "'":
+                if i + 1 < n and sql[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = False
+            i += 1
+            continue
+
+        # Handle double-quoted string with escaped "".
+        if in_double:
+            if ch == '"':
+                if i + 1 < n and sql[i + 1] == '"':
+                    i += 2
+                    continue
+                in_double = False
+            i += 1
+            continue
+
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+
+        if ch == "?":
+            count += 1
+            i += 1
+            continue
+
+        if ch == "%" and i + 1 < n and sql[i + 1] == "s":
+            count += 1
+            i += 2
+            continue
+
+        i += 1
+
+    return count
+
+
+class CaseBuilder:
+    """
+    Fluent CASE expression builder, modeled after aglipanci/laravel-eloquent-case.
+    Usage:
+        qb.case_when()\
+          .when("status = %s").then("Active")\
+          .when("status = %s").then("Suspended")\
+          .else_("Other")\
+          .as_("status_label")
+    """
+
+    def __init__(self, qb: "QueryBuilder"):
+        self.qb = qb
+        self._cases: list[tuple[str, Any]] = []
+        # (sql_fragment, value, bindings_for_raw_else)
+        self._else: tuple[str | None, Any | None, list[Any]] = (None, None, [])
+        self._open_condition: str | None = None
+
+        # --- fluent steps ---
+
+    def when(self, condition_sql: str) -> "CaseBuilder":
+        if self._open_condition:
+            raise ValueError("Call then() after when() before adding another when().")
+        self._open_condition = condition_sql
+        return self
+
+    def when_raw(self, condition_sql: str) -> "CaseBuilder":
+        return self.when(condition_sql)
+
+    def then(self, value: Any) -> "CaseBuilder":
+        if not self._open_condition:
+            raise ValueError("Call when() before then().")
+        self._cases.append((self._open_condition, value))
+        self._open_condition = None
+        return self
+
+    def then_raw(self, raw_sql: str) -> "CaseBuilder":
+        # raw_sql is inserted verbatim, not parameterized
+        return self.then(Raw(raw_sql))
+
+    def else_(self, value: Any) -> "CaseBuilder":
+        self._else = ("%s", value, [])
+        return self
+
+    def else_raw(self, raw_sql: str, bindings: list[Any] = None) -> "CaseBuilder":
+        self._else = (raw_sql, None, bindings or [])
+        return self
+
+        # --- materialization ---
+
+    def to_sql(self) -> str:
+        if not self._cases:
+            raise ValueError("At least one WHEN/THEN pair is required.")
+        parts = []
+        for cond, val in self._cases:
+            parts.append(f"WHEN {cond} THEN %s" if not isinstance(val, Raw) else f"WHEN {cond} THEN {val.expression}")
+        else_sql, _, _ = self._else
+        if else_sql is None:
+            else_sql = "NULL"
+        elif else_sql == "%s":
+            else_sql = "%s"
+            # else_sql could be raw literal
+        return f"CASE {' '.join(parts)} ELSE {else_sql} END"
+
+    def get_bindings(self) -> list[Any]:
+        bindings = []
+        for _, val in self._cases:
+            if not isinstance(val, Raw):
+                bindings.append(val)
+        _, else_val, else_bindings = self._else
+        if else_val is not None:
+            bindings.append(else_val)
+        bindings.extend(else_bindings)
+        return bindings
+
+    def as_(self, alias: str) -> "QueryBuilder":
+        if self._open_condition:
+            raise ValueError("Call then() after the last when() before as_().")
+        sql = f"{self.to_sql()} AS {alias}"
+        self.qb.columns.append(Raw(sql))
+        self.qb.parameters.extend(self.get_bindings())
+        return self.qb
+
+
 class QueryBuilder:
     __database__ = None
 
@@ -111,6 +256,7 @@ class QueryBuilder:
         cloned.offset_count = self.offset_count
         cloned.rows_fetch = self.rows_fetch
         cloned.distinct_flag = self.distinct_flag
+        cloned._pagination_param_count = getattr(self, "_pagination_param_count", 0)
         return cloned
 
     def clone_without_columns_or_ordering(self) -> "QueryBuilder":
@@ -140,6 +286,7 @@ class QueryBuilder:
         cloned.offset_count = self.offset_count
         cloned.rows_fetch = self.rows_fetch
         cloned.distinct_flag = self.distinct_flag
+        cloned._pagination_param_count = getattr(self, "_pagination_param_count", 0)
         return cloned
 
     def table(self, table_name: str, alias: str = None):
@@ -782,7 +929,26 @@ class QueryBuilder:
             self.parameters.extend(nested.parameters)
         return self
 
-    def case(self, cases: List[Tuple[str, Any]], else_result: Any, alias: str):
+    def case_when(self) -> CaseBuilder:
+        return CaseBuilder(self)
+
+    def case(self, cases, else_result=None, alias=None):
+        """
+        Backward-compatible overload:
+        - Existing (list, else, alias) signature still works.
+        - If `cases` is a CaseBuilder, append its SQL/bindings onto THIS builder (so the CaseBuilder
+          may be constructed independently of this query).
+        """
+        if isinstance(cases, CaseBuilder):
+            if not alias:
+                raise ValueError("Alias required when passing CaseBuilder.")
+            # materialize the CaseBuilder on the current query (not the CaseBuilder's qb)
+            self.columns.append(Raw(f"{cases.to_sql()} AS {alias}"))
+            # Prepend bindings so they stay ahead of WHERE params that may already exist
+            self.parameters = cases.get_bindings() + self.parameters
+            return self
+
+            # legacy path
         parts = [f"WHEN {condition} THEN %s" for condition, _ in cases]
         self.parameters.extend([val for _, val in cases])
         self.parameters.append(else_result)
@@ -820,15 +986,10 @@ class QueryBuilder:
         self.limit_count = None
         self.offset_count = None
         self.rows_fetch = None
-        if not hasattr(self, "_pagination_params"):
-            self._pagination_params = []
-        # Remove previously injected pagination params by identity, not value
-        for p in getattr(self, "_pagination_params", []):
-            try:
-                self.parameters.remove(p)
-            except ValueError:
-                pass
-        self._pagination_params = []
+        prev_pagination_count = getattr(self, "_pagination_param_count", 0)
+        if prev_pagination_count:
+            self.parameters = self.parameters[:-prev_pagination_count]
+        self._pagination_param_count = 0
 
         offset = (page - 1) * per_page
 
@@ -838,19 +999,19 @@ class QueryBuilder:
                 raise ValueError("MSSQL requires ORDER BY clause for pagination.")
             self.offset_count = "%s"
             self.parameters.append(offset)
-            self._pagination_params.append(offset)
+            self._pagination_param_count += 1
 
             self.rows_fetch = "%s"
             self.parameters.append(per_page)
-            self._pagination_params.append(per_page)
+            self._pagination_param_count += 1
         else:
             self.limit_count = "%s"
             self.parameters.append(per_page)
-            self._pagination_params.append(per_page)
+            self._pagination_param_count += 1
 
             self.offset_count = "%s"
             self.parameters.append(offset)
-            self._pagination_params.append(offset)
+            self._pagination_param_count += 1
 
         return self
 
@@ -893,13 +1054,15 @@ class QueryBuilder:
 
         placeholders_str = ", ".join(placeholders)
 
+        pk_col = None
         if self.__driver__ == "mysql":
             sql = f"INSERT INTO {self.__table__} ({columns}) VALUES ({placeholders_str})"
         else:  # mssql
-            sql = f"INSERT INTO {self.__table__} ({columns}) OUTPUT INSERTED.* VALUES ({placeholders_str})"
+            pk_col = self._quote_column(self.__primary_key__ or "id")
+            sql = f"INSERT INTO {self.__table__} ({columns}) OUTPUT INSERTED.{pk_col} VALUES ({placeholders_str})"
 
-        if has_triggers:
-            sql = sql.replace("OUTPUT INSERTED.*", "")
+        if has_triggers and self.__driver__ == "mssql":
+            sql = sql.replace(f"OUTPUT INSERTED.{pk_col}", "")
 
         pprint.pp(sql)
         return sql, params
@@ -1015,13 +1178,15 @@ class QueryBuilder:
         if not values:
             raise ValueError("No update values provided.")
 
+        placeholder = "?" if getattr(builder, "__driver__", None) == "mssql" else "%s"
+
         set_parts = []
         set_params = []
         for column, value in values.items():
             if isinstance(value, Raw):
                 set_parts.append(f"{builder._quote_column(column)} = {value.expression}")
             else:
-                set_parts.append(f"{builder._quote_column(column)} = %s")
+                set_parts.append(f"{builder._quote_column(column)} = {placeholder}")
                 set_params.append(value)
         set_clause = ", ".join(set_parts)
 

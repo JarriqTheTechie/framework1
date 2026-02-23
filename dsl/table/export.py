@@ -11,7 +11,7 @@ class TableExportMixin:
     def export_excel(self, filename: str = None):
         fields = [
             f
-            for f in self.schema()
+            for f in self._get_schema_cached()
             if hasattr(f, "_hidden")
             and not (callable(f._hidden) and f._hidden({}))
             and not (isinstance(f._hidden, bool) and f._hidden)
@@ -42,9 +42,43 @@ class TableExportMixin:
             c.alignment = Alignment(horizontal="center")
 
         # --- Rows ---
-        for record in self.data:
+        for record in self._ensure_data_loaded(force_query_get=True):
             record_dict = record_to_dict(record)
-            ws.append([field._format_value(record_dict.get(field.name(), ""), record_dict) for field in fields])
+
+            # Guard: ensure we always have a mapping for field lookups
+            if not hasattr(record_dict, "get"):
+                if hasattr(record, "to_dict"):
+                    record_dict = record.to_dict()
+                elif isinstance(record_dict, dict):
+                    pass
+                else:
+                    # Fallback to single-value mapping to avoid hard failure
+                    record_dict = {"value": record_dict}
+
+            row_values = []
+            for field in fields:
+                # Support nested fields like "client.Name" (mirrors render.py)
+                if "." in field.name():
+                    value = record_dict
+                    for part in field.name().split("."):
+                        if isinstance(value, dict):
+                            value = value.get(part, "")
+                        else:
+                            value = getattr(value, part, "")
+                        if value in (None, ""):
+                            break
+                else:
+                    value = record_dict.get(field.name(), "")
+                    if value in (None, "") and hasattr(record, field.name()):
+                        # Fallback to attribute access for ActiveRecord instances
+                        try:
+                            value = getattr(record, field.name())
+                        except Exception:
+                            value = ""
+
+                row_values.append(field._format_value(value, record_dict))
+
+            ws.append(row_values)
 
         # --- Custom footer hook ---
         if hasattr(self, "get_export_footer"):

@@ -2,9 +2,10 @@ from typing import Self
 
 from markupsafe import Markup, escape
 
-from framework1 import render_template_string_safe_internal
+from framework1 import render_template_string_safe_internal, profile_component
 from framework1.core_services.Request import Request
 
+from .actions import TableAction
 from .fields import Field
 from .master_detail import MasterDetailRow
 from .utils import record_to_dict
@@ -14,14 +15,72 @@ class TableRenderMixin:
     def render(self) -> Markup:
         """Generate HTML for the table with improved configurability."""
         request = Request()
-        fields = self.schema()
+        fields = self._get_schema_cached()
+        callable_arity_cache = {}
+
+        def callable_arity(fn) -> int:
+            arity = callable_arity_cache.get(fn)
+            if arity is not None:
+                return arity
+            try:
+                from inspect import signature
+                arity = len(signature(fn).parameters)
+            except Exception:
+                arity = 1
+            callable_arity_cache[fn] = arity
+            return arity
+
+        def resolve_visible_fields(fields: list[Field]):
+            """Apply toggleable column preferences + hidden flags."""
+            session = request.session()
+            toggleables = [f for f in fields if getattr(f, "_toggleable", False)]
+
+            raw = request.input(f"{self.table_name}[columns]", None)
+            chosen = [c.strip() for c in raw.split(",") if c.strip()] if raw else None
+
+            if chosen is None and getattr(self, "persist_columns", False):
+                chosen = session.get(f"{self.table_name}_columns", None)
+                if isinstance(chosen, str):
+                    chosen = [c for c in chosen.split(",") if c]
+
+            if getattr(self, "persist_columns", False) and chosen is not None:
+                session[f"{self.table_name}_columns"] = chosen
+
+            def is_visible(field: Field, record=None):
+                # honor explicit hidden
+                hidden = field._hidden(record) if callable(getattr(field, "_hidden", None)) and record else field._hidden
+                if hidden:
+                    return False
+                if getattr(field, "_toggleable", False):
+                    if chosen is not None:
+                        return field.name() in chosen
+                    return getattr(field, "_default_visible", True)
+                return True
+
+            visible_fields = [f for f in fields if is_visible(f)]
+            visible_names = [f.name() for f in visible_fields]
+            return visible_fields, toggleables, visible_names
+
+        with profile_component(f"{self.table_name}.resolve_visible_fields", kind="table"):
+            fields, toggleable_fields, visible_field_names = resolve_visible_fields(fields)
+
+        has_row_actions = hasattr(self, "has_custom_actions") and self.has_custom_actions()
 
         def build_table_header(fields: list[Field]) -> list[str]:
+            from urllib.parse import urlencode
+
             header = [f'<thead class="{self.thead_class}"><tr>']
             if getattr(self, "selectable"):
                 header.append('<th class="text-center"><input type="checkbox" class="select-all"></th>')
-            existing_fields = request.input(f"{self.table_name}[sort]", "").split(",")
+            existing_fields = [f for f in request.input(f"{self.table_name}[sort]", "").split(",") if f]
             existing_dirs = request.input(f"{self.table_name}[sort_dir]", "").split(",")
+            sort_index = {name: idx for idx, name in enumerate(existing_fields)}
+            sort_dir_by_field = {
+                name: (existing_dirs[idx] if idx < len(existing_dirs) and existing_dirs[idx] else "asc")
+                for name, idx in sort_index.items()
+            }
+            base_query_args = request.all()
+            base_path = request.path()
 
             for field in fields:
                 if isinstance(field, MasterDetailRow):
@@ -33,11 +92,12 @@ class TableRenderMixin:
 
                 th_classes = field.class_name()
                 content = field.header()
+                field_name = field.name()
 
                 if getattr(field, "_sortable", False):
-                    if field.name() in existing_fields:
-                        idx = existing_fields.index(field.name())
-                        current_dir = existing_dirs[idx] if idx < len(existing_dirs) else "asc"
+                    existing_idx = sort_index.get(field_name)
+                    if existing_idx is not None:
+                        current_dir = sort_dir_by_field.get(field_name, "asc")
                         next_dir = "desc" if current_dir == "asc" else "asc"
                     else:
                         next_dir = "asc"
@@ -45,30 +105,27 @@ class TableRenderMixin:
                     new_fields = existing_fields.copy()
                     new_dirs = existing_dirs.copy()
 
-                    if field.name() in existing_fields:
-                        idx = existing_fields.index(field.name())
-                        new_dirs[idx] = next_dir
+                    if existing_idx is not None:
+                        new_dirs[existing_idx] = next_dir
                     else:
-                        new_fields.append(field.name())
+                        new_fields.append(field_name)
                         new_dirs.append(next_dir)
 
-                    query_args = request.all()
+                    query_args = dict(base_query_args)
                     query_args[f"{self.table_name}[sort]"] = ",".join(new_fields)
                     query_args[f"{self.table_name}[sort_dir]"] = ",".join(new_dirs)
-
-                    from urllib.parse import urlencode
-
-                    sort_url = f"{request.path()}?{urlencode(query_args)}"
+                    sort_url = f"{base_path}?{urlencode(query_args)}"
 
                     icon = ""
-                    if field.name() in existing_fields:
-                        idx = existing_fields.index(field.name())
-                        dir_icon = existing_dirs[idx] if idx < len(existing_dirs) else "asc"
+                    if existing_idx is not None:
+                        dir_icon = sort_dir_by_field.get(field_name, "asc")
                         icon = f' <i class="ri-arrow-{"up-long-line" if dir_icon == "asc" else "down-long-line"}"></i>'
 
                     content = f'<a href="{sort_url}">{content}{icon}</a>'
 
                 header.append(f'<th class="{th_classes}">{content}</th>')
+            if has_row_actions:
+                header.append('<th class="text-end">Actions</th>')
             header.append("</tr></thead>")
             return header
 
@@ -77,8 +134,6 @@ class TableRenderMixin:
                 formatted_value = value
             else:
                 formatted_value = field._format_value(value, record)
-
-            record = record_to_dict(record)
 
             # Handle character limit
             if hasattr(field, "_limit") and field._limit is not None:
@@ -128,10 +183,7 @@ class TableRenderMixin:
             # Add description if present
             if getattr(field, "_description", None):
                 if callable(field._description):
-                    from inspect import signature
-
-                    sig = signature(field._description)
-                    if len(sig.parameters) == 2:
+                    if callable_arity(field._description) == 2:
                         description_text = field._description(record, record)
                     else:
                         description_text = field._description(record)
@@ -176,10 +228,7 @@ class TableRenderMixin:
             if getattr(field, "_tooltip", None):
                 tooltip = field._tooltip
                 if callable(tooltip):
-                    from inspect import signature
-
-                    sig = signature(tooltip)
-                    if len(sig.parameters) == 2:
+                    if callable_arity(tooltip) == 2:
                         tooltip_text = tooltip(record, record)
                     else:
                         tooltip_text = tooltip(record)
@@ -197,8 +246,20 @@ class TableRenderMixin:
         def build_table_body(data: list, fields: list[Field]) -> list[str]:
             body = [f'<tbody class="{self.tbody_class}">']
             has_default_actions = self.has_default_actions()
-            has_custom_actions = self.has_custom_actions()
             has_master_detail = any(isinstance(field, MasterDetailRow) for field in fields)
+            first_field_name = fields[0].name() if fields else None
+            field_specs = []
+            for field in fields:
+                if isinstance(field, MasterDetailRow):
+                    continue
+                field_name = field.name()
+                field_specs.append({
+                    "field": field,
+                    "name": field_name,
+                    "parts": field_name.split(".") if "." in field_name else None,
+                    "base_class": field.class_name(),
+                    "is_first": field_name == first_field_name,
+                })
             for record in data:
                 record = record_to_dict(record)
 
@@ -215,9 +276,9 @@ class TableRenderMixin:
                         f'<td class="text-center"><input type="checkbox" class="row-select" value="{record.get(self.key_id)}"></td>'
                     )
 
-                for field in fields:
-                    if isinstance(field, MasterDetailRow):
-                        continue
+                for spec in field_specs:
+                    field = spec["field"]
+                    field_name = spec["name"]
 
                     is_hidden = False
                     if callable(field._hidden):
@@ -228,16 +289,15 @@ class TableRenderMixin:
                     if is_hidden:
                         continue
 
-                    if "." in field.name():
+                    if spec["parts"]:
                         # Support nested fields like "user.name"
-                        parts = field.name().split(".")
                         value = record
-                        for part in parts:
+                        for part in spec["parts"]:
                             value = value.get(part, "")
                             if not value:
                                 break
                     else:
-                        value = record.get(field.name(), "")
+                        value = record.get(field_name, "")
 
                     content = build_cell_content(field, value, record)
 
@@ -247,16 +307,16 @@ class TableRenderMixin:
                         if callable(field._extra_cell_attributes):
                             attr_dict = field._extra_cell_attributes(record)
                         else:
-                            attr_dict = field._extra_cell_attributes
+                            attr_dict = dict(field._extra_cell_attributes)
 
                     # Merge class names
-                    base_class = field.class_name()
+                    base_class = spec["base_class"]
                     extra_class = attr_dict.pop("class", "")
                     combined_class = f"{base_class} {extra_class}".strip()
 
                     # Build other attribute string, escape values for safety
                     attr_str = " ".join(f'{k}="{escape(v)}"' for k, v in attr_dict.items())
-                    if field.name() == fields[0].name():
+                    if spec["is_first"]:
                         collapse_toggle = ""
                         if has_master_detail and getattr(self, "master_detail_expandable", None):
                             collapse_toggle = (
@@ -267,16 +327,25 @@ class TableRenderMixin:
                                 ' <i class="ri-arrow-down-s-line icon-expanded"></i> </button>'
                             )
                         row.append(
-                            f'<td data-framework1-field-name="{field.name()}" class="{combined_class}" {attr_str}>{collapse_toggle} {content}</td>'
+                            f'<td data-framework1-field-name="{field_name}" class="{combined_class}" {attr_str}>{collapse_toggle} {content}</td>'
                         )
                     else:
                         row.append(
-                            f'<td data-framework1-field-name="{field.name()}" class="{combined_class}" {attr_str}>{content}</td>'
+                            f'<td data-framework1-field-name="{field_name}" class="{combined_class}" {attr_str}>{content}</td>'
                         )
 
-                if has_default_actions and has_custom_actions:
-                    row.append(f'<td data-framework1-field-name="" class="">Delete {record_data}</td>')
-                    row.append(self.get_custom_actions(record_data))
+                if has_row_actions:
+                    actions_html = []
+                    try:
+                        row_actions = self.get_custom_actions(record)
+                    except Exception:
+                        row_actions = []
+                    for action in row_actions or []:
+                        if isinstance(action, TableAction):
+                            actions_html.append(action.render(record, record.get(self.key_id)))
+                        else:
+                            actions_html.append(str(action))
+                    row.append(f'<td class="table-actions text-end">{" ".join(actions_html)}</td>')
 
                 row.append("</tr>")
                 body.extend(row)
@@ -320,6 +389,49 @@ class TableRenderMixin:
             if not hasattr(pagination, "items"):
                 return []
 
+            if getattr(pagination, "mode", None) == "keyset":
+                return [
+                    render_template_string_safe_internal(
+                        "table-dsl/pagination-keyset.html",
+                        data=self.data,
+                        has_next=getattr(pagination, "has_next", False),
+                        next_cursor=getattr(pagination, "next_cursor", None),
+                        current_cursor=getattr(pagination, "current_cursor", None),
+                        cursor_param=getattr(pagination, "cursor_param", "cursor"),
+                        table_name=self.__class__.__name__,
+                        request=request,
+                    )
+                ]
+            if getattr(pagination, "mode", None) == "simple":
+                current_page = getattr(pagination, "current_page", 1)
+                has_prev = getattr(pagination, "has_prev", False)
+                has_next = getattr(pagination, "has_next", False)
+                prev_href = request.clean_table_url(self.__class__.__name__, {"page": current_page - 1}) if has_prev else "#"
+                next_href = request.clean_table_url(self.__class__.__name__, {"page": current_page + 1}) if has_next else "#"
+                return [
+                    f"""
+                    <nav aria-label="Simple pagination" class="mt-3">
+                        <div class="d-flex align-items-center justify-content-between">
+                            <div class="pagination-info">
+                                Showing {len(self.data)} items
+                            </div>
+                            <ul class="pagination mb-0">
+                                <li class="page-item {"disabled" if not has_prev else ""}">
+                                    <a class="page-link" href="{prev_href}" {"tabindex='-1'" if not has_prev else ""}>
+                                        Previous
+                                    </a>
+                                </li>
+                                <li class="page-item {"disabled" if not has_next else ""}">
+                                    <a class="page-link" href="{next_href}" {"tabindex='-1'" if not has_next else ""}>
+                                        Next
+                                    </a>
+                                </li>
+                            </ul>
+                        </div>
+                    </nav>
+                    """
+                ]
+
             total = pagination.total
             current_page = pagination.current_page
             last_page = pagination.last_page
@@ -344,10 +456,22 @@ class TableRenderMixin:
         ]
 
         search_session_key = f"{self.__class__.__name__}_search"
-        search_value = escape(Request().input("search", request.session().get(search_session_key, "")))
+        search_value = escape(request.input("search", request.session().get(search_session_key, "")))
         search_placeholder = self.search_placeholder
 
         table_actions_header = []
+        header_actions = []
+        if hasattr(self, "has_header_actions") and self.has_header_actions():
+            try:
+                header_actions = self.get_header_actions() or []
+            except Exception:
+                header_actions = []
+        bulk_actions = []
+        if hasattr(self, "has_bulk_actions") and self.has_bulk_actions():
+            try:
+                bulk_actions = [a for a in (self.get_bulk_actions() or []) if getattr(a, "scope", "row") == "bulk"]
+            except Exception:
+                bulk_actions = []
 
         if not bool(self.sub_resource_table):
             table_actions_header.insert(
@@ -362,36 +486,180 @@ class TableRenderMixin:
         if getattr(self, "model", None) and getattr(self.model, "__exportable__", False):
             query_args = request.all()
             query_args["table"] = self.__class__.__name__
-            export_url = f"/f1/export-excel?{__import__('urllib.parse').parse.urlencode(query_args)}"
+            export_url = f"/f1/export-csv-chunked?{__import__('urllib.parse').parse.urlencode(query_args)}"
             table_actions_header.append(
-                f'<a class="btn btn-outline-secondary btn-sm ms-2" href="{export_url}">Export</a>'
+                f'<a class="btn btn-outline-secondary btn-sm ms-2" href="{export_url}">Export CSV</a>'
             )
+
+        # Header actions (non-bulk)
+        for action in header_actions:
+            if isinstance(action, TableAction) and getattr(action, "scope", "row") == "header":
+                table_actions_header.append(action.render({}))
+
+        # Column visibility picker
+        if toggleable_fields:
+            checkbox_rows = []
+            for f in toggleable_fields:
+                checked = "checked" if f.name() in visible_field_names or getattr(f, "_default_visible", True) else ""
+                checkbox_rows.append(
+                    f'<div class="form-check">'
+                    f'<input class="form-check-input" type="checkbox" value="{escape(f.name())}" id="{self.table_name}_col_{escape(f.name())}" {checked}>'
+                    f'<label class="form-check-label" for="{self.table_name}_col_{escape(f.name())}">{escape(f.header())}</label>'
+                    f"</div>"
+                )
+
+            column_picker_html = f"""
+            <div class="dropdown ms-2">
+              <button class="btn btn-outline-secondary btn-sm dropdown-toggle" type="button" data-bs-toggle="dropdown">
+                Columns
+              </button>
+              <div class="dropdown-menu p-3" style="min-width: 220px;">
+                <form id="{self.table_name}_column_form" method="get">
+                  <input type="hidden" name="{self.table_name}[columns]" id="{self.table_name}_columns_input">
+                  {''.join(checkbox_rows)}
+                  <button type="submit" class="btn btn-primary btn-sm mt-2 w-100">Apply</button>
+                </form>
+              </div>
+            </div>
+            <script>
+            (function() {{
+              var form = document.getElementById("{self.table_name}_column_form");
+              if (!form) return;
+              var hidden = document.getElementById("{self.table_name}_columns_input");
+              var checks = form.querySelectorAll('input[type="checkbox"]');
+              function sync() {{
+                hidden.value = Array.prototype.slice.call(checks).filter(function(c) {{ return c.checked; }}).map(function(c) {{ return c.value; }}).join(',');
+              }}
+              checks.forEach(function(c) {{ c.addEventListener('change', sync); }});
+              sync();
+            }})();
+            </script>
+            """
+            table_actions_header.append(column_picker_html)
+
+        # Bulk actions dropdown (requires selectable checkboxes)
+        if bulk_actions and getattr(self, "selectable"):
+            bulk_buttons = []
+            for action in bulk_actions:
+                action_url = action._resolve_url({})
+                confirm_attr = f" data-confirm=\"{escape(action.confirm)}\"" if getattr(action, 'confirm', None) else ""
+                bulk_buttons.append(
+                    f'<button type="button" class="dropdown-item bulk-action-btn" data-url="{escape(action_url)}" '
+                    f'data-method="{escape(action.method)}"{confirm_attr}>{escape(action.label)}</button>'
+                )
+            bulk_html = f"""
+            <div class="dropdown ms-2">
+              <button class="btn btn-outline-secondary btn-sm dropdown-toggle" type="button" data-bs-toggle="dropdown">
+                Bulk Actions
+              </button>
+              <div class="dropdown-menu">
+                {''.join(bulk_buttons)}
+              </div>
+            </div>
+            <form id="{self.table_name}_bulk_form" method="post" class="d-none"></form>
+            <script>
+            (function() {{
+              var form = document.getElementById("{self.table_name}_bulk_form");
+              var table = document.getElementById("{self.table_name}");
+              if (!table) return;
+              function checkboxes() {{ return table.querySelectorAll('.row-select'); }}
+              function selectedIds() {{
+                return Array.prototype.slice.call(checkboxes()).filter(function(c) {{ return c.checked; }}).map(function(c) {{ return c.value; }});
+              }}
+              (table.closest('.table-responsive') || document).querySelectorAll('.bulk-action-btn').forEach(function(btn) {{
+                btn.addEventListener('click', function() {{
+                  var ids = selectedIds();
+                  if (!ids.length) return alert('Select at least one row.');
+                  var confirmText = btn.getAttribute('data-confirm');
+                  if (confirmText && !window.confirm(confirmText)) return;
+                  // clear previous
+                  form.innerHTML = '';
+                  var idsInput = document.createElement('input');
+                  idsInput.type = 'hidden';
+                  idsInput.name = 'ids';
+                  idsInput.value = ids.join(',');
+                  form.appendChild(idsInput);
+                  var methodInput = document.createElement('input');
+                  methodInput.type = 'hidden';
+                  methodInput.name = '_method';
+                  methodInput.value = (btn.getAttribute('data-method') || 'POST').toUpperCase();
+                  form.appendChild(methodInput);
+                  form.action = btn.getAttribute('data-url');
+                  form.method = 'post';
+                  form.submit();
+                }});
+              }});
+            }})();
+            </script>
+            """
+            table_actions_header.append(bulk_html)
 
         html.insert(
             0,
             f"<div class='table-actions d-inline-flex my-3 justify-content-end'>{''.join(table_actions_header)}</div>",
         )
 
-        html.extend(build_table_header(fields))
+        with profile_component(f"{self.table_name}.build_table_header", kind="table"):
+            html.extend(build_table_header(fields))
 
-        if self.data:
-            html.extend(build_table_body(self.data, fields))
+        with profile_component(f"{self.table_name}.load_data", kind="table"):
+            data = self._ensure_data_loaded()
+        if data:
+            with profile_component(f"{self.table_name}.build_table_body", kind="table"):
+                html.extend(build_table_body(data, fields))
 
         html.append("</table>")
-        html.extend(build_pagination())
+        with profile_component(f"{self.table_name}.build_pagination", kind="table"):
+            html.extend(build_pagination())
         html.append("</div>")
+
+        if getattr(self, "selectable", False):
+            html.append(
+                f"""
+                <script>
+                (function() {{
+                  var table = document.getElementById("{self.__class__.__name__}");
+                  if (!table) return;
+                  var selectAll = table.querySelector('.select-all');
+                  var rows = function() {{ return table.querySelectorAll('.row-select'); }};
+                  function syncSelectAll() {{
+                    if (!selectAll) return;
+                    var boxes = Array.prototype.slice.call(rows());
+                    if (!boxes.length) return;
+                    var allChecked = boxes.every(function(c) {{ return c.checked; }});
+                    var anyChecked = boxes.some(function(c) {{ return c.checked; }});
+                    selectAll.indeterminate = !allChecked && anyChecked;
+                    selectAll.checked = allChecked;
+                  }}
+                  if (selectAll) {{
+                    selectAll.addEventListener('change', function() {{
+                      var checked = selectAll.checked;
+                      rows().forEach(function(c) {{ c.checked = checked; }});
+                      syncSelectAll();
+                    }});
+                  }}
+                  rows().forEach(function(c) {{
+                    c.addEventListener('change', syncSelectAll);
+                  }});
+                  syncSelectAll();
+                }})();
+                </script>
+                """
+            )
 
         from framework1.dsl.F1TableFilterForm import F1TableFilterForm
 
         if len(self.filterable_fields) != 0:
-            filter_form = F1TableFilterForm(request.all()).set_resource_from_table(self)
-            filter_bar_css = render_template_string_safe_internal("table-dsl/filter-bar-styles.html")
-            filter_bar = render_template_string_safe_internal(
-                "table-dsl/filter-bar.html", filter_form=filter_form, filter_bar_css=filter_bar_css
-            )
-            html.insert(1, filter_bar)
+            with profile_component(f"{self.table_name}.build_filter_bar", kind="table"):
+                filter_form = F1TableFilterForm(request.all()).set_resource_from_table(self)
+                filter_bar_css = render_template_string_safe_internal("table-dsl/filter-bar-styles.html")
+                filter_bar = render_template_string_safe_internal(
+                    "table-dsl/filter-bar.html", filter_form=filter_form, filter_bar_css=filter_bar_css
+                )
+                html.insert(1, filter_bar)
 
-        return Markup("\n".join(html))
+        with profile_component(f"{self.table_name}.render_markup_join", kind="table"):
+            return Markup("\n".join(html))
 
     def __str__(self) -> Self:
         """Return HTML when the object is converted to a string."""

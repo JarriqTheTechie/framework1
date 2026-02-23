@@ -1,9 +1,7 @@
-import pprint
-
-import glob
-import os
-import pydoc
-from pydoc import locate
+import importlib
+import inspect
+import pkgutil
+from pathlib import Path
 
 from framework1.service_container._ServiceContainer import ServiceContainer
 
@@ -18,52 +16,63 @@ def to_class(path: str) -> object | None:
     Returns:
         Union[type, None]: The Python class if found, otherwise None.
     """
-    try:
-        class_instance = locate(path)
-    except ImportError:
-        print('Module does not exist')
+    if not path or "." not in path:
         return None
-    except pydoc.ErrorDuringImport as e:
-        print(f"Error during import: {e} for {path}")
-    return class_instance
+    module_path, class_name = path.rsplit(".", 1)
+    try:
+        module = importlib.import_module(module_path)
+    except Exception:
+        return None
+    class_instance = getattr(module, class_name, None)
+    return class_instance if inspect.isclass(class_instance) else None
+
+
+def _register_service(app, service_class):
+    if not service_class:
+        return
+    if getattr(service_class, "__singleton__", False):
+        app.container.add(service_class.__name__, service_class, singleton=True)
+    else:
+        app.container.add(service_class.__name__, service_class)
+
+
+def _load_service_from_module(app, module_name: str, class_name: str, debug=False):
+    service_class = to_class(f"{module_name}.{class_name}")
+    if not service_class:
+        if debug:
+            app.logger.debug(f"[Framework1] Skipping unresolved service: {module_name}.{class_name}")
+        return
+    _register_service(app, service_class)
 
 
 def init_container(app, services_path: str = "lib/services", debug=False):
-    import sys
     app.container = ServiceContainer()
-    venv_path = sys.prefix
 
-    core_services = glob.glob(f"{venv_path}/Lib/site-packages/framework1/core_services/*.py")
-    for service in core_services:
-        # get the service class name
-        service_class_name = service.split("/")[-1][:-3].split("\\")[-1]
-        service_module_name = service.replace("/", ".").replace("\\", ".")[:-3]
-        start_index = service_module_name.find("framework1")
-        final_service_module_name = service_module_name[start_index:]
+    # Register Framework1 core services directly from the installed package.
+    import framework1.core_services as core_services_pkg
+    for module_info in pkgutil.iter_modules(core_services_pkg.__path__):
+        service_name = module_info.name
+        if service_name.startswith("__"):
+            continue
+        module_name = f"{core_services_pkg.__name__}.{service_name}"
+        _load_service_from_module(app, module_name, service_name, debug=debug)
 
-        service_class = to_class(f"{final_service_module_name}.{service_class_name}")
-        if service_class:
-            if getattr(service_class, "__singleton__", False):
-                app.container.add(service_class.__name__, service_class, singleton=True)
-            else:
-                app.container.add(service_class.__name__, service_class)
+    paths = services_path.split(";") if ";" in services_path else [services_path]
+    cwd = Path.cwd()
 
-    
-    services = glob.glob(f"{os.getcwd()}/{services_path}/*.py")
-    for service in services:
-        # get the service class name
-        service_class_name = service.split("/")[-1][:-3].split("\\")[-1]
-        service_module_name = service.replace("/", ".").replace("\\", ".")[:-3]
-        service_path_dotted = services_path.replace("/", ".").replace("\\", ".")
-        start_index = service_module_name.find(service_path_dotted)
-        final_service_module_name = service_module_name[start_index:]
+    for path in paths:
+        services_dir = (cwd / path).resolve()
+        if not services_dir.exists() or not services_dir.is_dir():
+            if debug:
+                app.logger.debug(f"[Framework1] Service path not found: {services_dir}")
+            continue
 
-        print(f"{final_service_module_name}.{service_class_name}")
-        service_class = to_class(f"{final_service_module_name}.{service_class_name}")
-        if service_class:
+        for service_file in services_dir.glob("*.py"):
+            if service_file.stem.startswith("__"):
+                continue
 
-            if getattr(service_class, "__singleton__", False):
-                app.container.add(service_class.__name__, service_class, singleton=True)
-            else:
-                app.container.add(service_class.__name__, service_class)
+            relative_path = service_file.with_suffix("").relative_to(cwd)
+            module_name = ".".join(relative_path.parts)
+            _load_service_from_module(app, module_name, service_file.stem, debug=debug)
+
     return app

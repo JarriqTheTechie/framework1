@@ -1,13 +1,13 @@
 import importlib
 import inspect
 from pathlib import Path
-from framework1.service_container._ServiceLoader import to_class
 import sys
 from framework1.database.ActiveRecord import ActiveRecord
 
 
 def discover_models(lib_path: str = "lib"):
     models = []
+    seen_models = set()
     base_dir = Path(lib_path)
 
     project_root = base_dir.parent
@@ -15,16 +15,13 @@ def discover_models(lib_path: str = "lib"):
         sys.path.insert(0, str(project_root))
 
     def _import_module(file_path: Path):
-        # Convert path to module path format, starting from lib
+        # Convert path to importable module path relative to the provided base dir.
         parts = file_path.relative_to(base_dir).with_suffix('').parts
-        module_name = f"lib.{'.'.join(parts)}"
-        spec = importlib.util.spec_from_file_location(module_name, str(file_path))
-
-        if spec and spec.loader:
-            module = importlib.util.module_from_spec(spec)
-
-            spec.loader.exec_module(module)
-            return module
+        module_name = f"{base_dir.name}.{'.'.join(parts)}"
+        try:
+            return importlib.import_module(module_name)
+        except Exception:
+            return None
 
 
     def _scan_models_directory(models_dir: Path):
@@ -34,7 +31,12 @@ def discover_models(lib_path: str = "lib"):
                 module = _import_module(item)
                 if module:
                     for name, obj in inspect.getmembers(module, inspect.isclass):
-                        if issubclass(obj, ActiveRecord) and obj != ActiveRecord:
+                        if (
+                            issubclass(obj, ActiveRecord)
+                            and obj != ActiveRecord
+                            and obj not in seen_models
+                        ):
+                            seen_models.add(obj)
                             models.append(obj)
 
     def _find_models_folders(directory: Path):

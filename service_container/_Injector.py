@@ -30,20 +30,24 @@ def get_parent_class(func):
     return None
 
 
-def service_resolver(param, func_name: str):
-    """Resolves and retrieves the appropriate service from the container."""
-    if not has_app_context():
-        raise RuntimeError(f"No Flask app context available for injecting '{param.name}' in '{func_name}'")
-
+def _service_name_for_param(param: inspect.Parameter):
     if param.annotation is inspect.Parameter.empty:
         return None
+    return param.annotation if isinstance(param.annotation, str) else getattr(param.annotation, "__name__", None)
 
-    service_name = param.annotation if isinstance(param.annotation, str) else param.annotation.__name__
+
+def service_resolver(service_name: str | None, param_name: str, func_name: str):
+    """Resolves and retrieves the appropriate service from the container."""
+    if not has_app_context():
+        raise RuntimeError(f"No Flask app context available for injecting '{param_name}' in '{func_name}'")
+
+    if not service_name:
+        return None
 
     container = current_app.container
     if not (container.has(service_name) or container.has_singleton(service_name)):
         raise ValueError(
-            f"[Injector] Cannot resolve service '{service_name}' for parameter '{param.name}' in '{func_name}'. "
+            f"[Injector] Cannot resolve service '{service_name}' for parameter '{param_name}' in '{func_name}'. "
             f"Ensure it is registered in the container."
         )
 
@@ -51,23 +55,30 @@ def service_resolver(param, func_name: str):
 
 
 def injector(func):
+    sig = inspect.signature(func)
+    needs_self = "self" in sig.parameters
+    parent_class_hint = get_parent_class(func) if needs_self else None
+    injectable_params = [
+        (name, _service_name_for_param(param))
+        for name, param in sig.parameters.items()
+        if name != "self"
+    ]
+
     @wraps(func)
     def wrapper(*args, **kwargs):
-        sig = inspect.signature(func)
-        parent_class = None
+        parent_class = parent_class_hint
 
         # Pre-instantiate controller methods so we never miss 'self'
-        if "self" in sig.parameters and "self" not in kwargs and not args:
-            parent_class = get_parent_class(func)
+        if needs_self and "self" not in kwargs and not args:
+            if parent_class is None:
+                parent_class = get_parent_class(func)
             if parent_class:
                 args = (parent_class(), *args)
 
-        for name, param in sig.parameters.items():
-            if name == "self":
-                continue  # skip injecting self; it's handled above
+        for name, service_name in injectable_params:
             if name in kwargs:  # already provided by Flask (e.g. user_id)
                 continue
-            service = service_resolver(param, func.__name__)
+            service = service_resolver(service_name, name, func.__name__)
             if service is not None:
                 kwargs[name] = service
         try:
@@ -75,7 +86,8 @@ def injector(func):
         except Exception as e:
             if "missing 1 required positional argument: 'self'" in str(e):
                 # This is likely a method that needs 'self' injected
-                parent_class = parent_class or get_parent_class(func)
+                if parent_class is None:
+                    parent_class = get_parent_class(func)
                 if parent_class and (not args or not isinstance(args[0], parent_class)):
                     instance = parent_class()
                     return func(instance, *args, **kwargs)

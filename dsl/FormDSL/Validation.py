@@ -5,12 +5,15 @@ class ValidationRule:
     def __init__(self, func, error_message: str):
         self.func = func
         self.error_message = error_message
+        try:
+            self._arity = len(inspect.signature(func).parameters)
+        except Exception:
+            self._arity = 1
 
     def validate(self, value, context=None):
-        sig = inspect.signature(self.func)
         try:
             # Supports func(value) or func(value, context)
-            if len(sig.parameters) == 2:
+            if self._arity == 2:
                 valid = self.func(value, context)
             else:
                 valid = self.func(value)

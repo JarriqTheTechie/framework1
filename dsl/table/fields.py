@@ -31,6 +31,8 @@ class Field:
         self._extra_attributes = None
         self._extra_cell_attributes = None
         self._hidden = False
+        self._toggleable = False
+        self._default_visible = True
 
     def name(self):
         return self.__name
@@ -263,6 +265,17 @@ class Field:
             value (bool | Callable): True/False or a callable(record) -> bool
         """
         self._hidden = value
+        return self
+
+    def toggleable(self, default_visible: bool = True):
+        """
+        Allow end users to show/hide this column from the column picker.
+
+        Args:
+            default_visible: Whether the column starts visible. Persisted choices override this.
+        """
+        self._toggleable = True
+        self._default_visible = default_visible
         return self
 
 

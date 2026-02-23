@@ -38,7 +38,7 @@ class NumberField(TextField):
         return self
 
     def set_max(self, max_value: int) -> Self:
-        self.set_data_attribute("min", max_value)
+        self.set_data_attribute("max", max_value)
         return self
 
     def set_step(self, step_value: int) -> Self:

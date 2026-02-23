@@ -8,7 +8,7 @@ import _mysql_connector
 import mysql.connector
 
 from framework1.core_services.Database import Database
-from framework1.database.QueryBuilder import QueryBuilder
+from framework1.database.QueryBuilder import QueryBuilder, count_sql_placeholders
 import logging
 
 
@@ -77,7 +77,7 @@ class MySqlDatabase(Database):
         if len(params) == 1 and isinstance(params[0], (list, tuple)):
             params = list(params[0])
 
-        total_placeholders = sum(query.count('%s') for query in queries)
+        total_placeholders = sum(count_sql_placeholders(query) for query in queries)
         if total_placeholders != len(params):
             raise ValueError(f"Expected {total_placeholders} parameters for pquery, received {len(params)}.")
 
@@ -107,41 +107,56 @@ class MySqlDatabase(Database):
 
         return all_results
 
-    def save(self, table: str, data: dict[str, Any], where: dict[str, Any] = None, primary_key: str = "id"):
+    def save(
+            self,
+            table: str,
+            data: dict[str, Any],
+            where: dict[str, Any] = None,
+            primary_key: str = "id",
+            refresh: bool = False
+    ):
         if not data:
             raise ValueError("No data provided.")
 
         cursor = self.connect()
-        
-
-        if where:
-            # UPDATE path
-            set_clause = ", ".join(f"`{k}` = %s" for k in data.keys())
-            where_clause = " AND ".join(f"`{k}` = %s" for k in where.keys())
-            sql = f"UPDATE `{table}` SET {set_clause} WHERE {where_clause}"
-            values = tuple(data.values()) + tuple(where.values())
-            start_time = time.perf_counter()
-            cursor.execute(sql, values)
-            self.connection.commit()
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            self._log_query(sql, values, elapsed_ms)
-            return self.query(f"SELECT * FROM `{table}` WHERE {where_clause}", *where.values())[
-                0] if cursor.rowcount else None
-        else:
-            # INSERT path
-            fields = ", ".join(f"`{k}`" for k in data.keys())
-            placeholders = ", ".join(["%s"] * len(data))
-            values = tuple(data.values())
-            sql = f"INSERT INTO `{table}` ({fields}) VALUES ({placeholders})"
-            start_time = time.perf_counter()
-            cursor.execute(sql, values)
-            self.connection.commit()
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            self._log_query(sql, values, elapsed_ms)
-            inserted_id = cursor.lastrowid
-            if inserted_id:
-                return self.query(f"SELECT * FROM `{table}` WHERE `{primary_key}` = %s", inserted_id)[0]
-            return None
+        try:
+            if where:
+                # UPDATE path
+                set_clause = ", ".join(f"`{k}` = %s" for k in data.keys())
+                where_clause = " AND ".join(f"`{k}` = %s" for k in where.keys())
+                sql = f"UPDATE `{table}` SET {set_clause} WHERE {where_clause}"
+                values = tuple(data.values()) + tuple(where.values())
+                start_time = time.perf_counter()
+                cursor.execute(sql, values)
+                self.connection.commit()
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                self._log_query(sql, values, elapsed_ms)
+                if not cursor.rowcount:
+                    return None
+                if refresh:
+                    return self.query(f"SELECT * FROM `{table}` WHERE {where_clause}", *where.values())[0]
+                return self.DotDict({**where, **data})
+            else:
+                # INSERT path
+                fields = ", ".join(f"`{k}`" for k in data.keys())
+                placeholders = ", ".join(["%s"] * len(data))
+                values = tuple(data.values())
+                sql = f"INSERT INTO `{table}` ({fields}) VALUES ({placeholders})"
+                start_time = time.perf_counter()
+                cursor.execute(sql, values)
+                self.connection.commit()
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                self._log_query(sql, values, elapsed_ms)
+                inserted_id = cursor.lastrowid
+                if not inserted_id:
+                    return None
+                if refresh:
+                    return self.query(f"SELECT * FROM `{table}` WHERE `{primary_key}` = %s", inserted_id)[0]
+                result = dict(data)
+                result[primary_key] = inserted_id
+                return self.DotDict(result)
+        finally:
+            self._cleanup()
 
     def _cleanup(self):
         try:
@@ -151,6 +166,25 @@ class MySqlDatabase(Database):
                 self.connection.close()
         except Exception:
             pass
+
+    def explain_sql(self, sql: str, params: tuple | list | None = None):
+        conn = None
+        cur = None
+        try:
+            conn = mysql.connector.connect(**self.connection_dict.copy())
+            cur = conn.cursor(dictionary=True)
+            cur.execute(f"EXPLAIN {sql}", tuple(params or ()))
+            return cur.fetchall()
+        except Exception:
+            return None
+        finally:
+            try:
+                if cur:
+                    cur.close()
+                if conn and conn.is_connected():
+                    conn.close()
+            except Exception:
+                pass
 
     @contextmanager
     def transaction(self) -> Generator[mysql.connector.connection.MySQLConnection, None, None]:
@@ -163,18 +197,18 @@ class MySqlDatabase(Database):
             if not self.connection or not self.connection.is_connected():
                 self.connect()
             self.connection.start_transaction()
-            print("Transaction started.")
+            self.logger.debug("Transaction started.")
             yield self.connection
             self.connection.commit()
-            print("Transaction committed.")
+            self.logger.debug("Transaction committed.")
         except Exception as e:
             if self.connection:
                 self.connection.rollback()
-                print("Transaction rolled back due to error:", e)
+                self.logger.warning(f"Transaction rolled back due to error: {e}")
             raise
         finally:
             if self.cursor:
                 self.cursor.close()
             if self.connection and self.connection.is_connected():
                 self.connection.close()
-                print("Database connection closed.")
+                self.logger.debug("Database connection closed.")

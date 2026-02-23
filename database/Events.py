@@ -1,8 +1,11 @@
+import logging
 from typing import Callable
 from typing import Optional
 from typing import TypeVar, Type
 
 from dataclasses import dataclass
+
+_logger = logging.getLogger("framework1.events")
 
 @dataclass(frozen=True)
 class DomainEvent:
@@ -66,7 +69,11 @@ class Events:
             try:
                 method()
             except Exception as e:
-                print(f"Error in event '{event_name}' for {target.__class__.__name__}: {e}")
+                _logger.exception(
+                    "Error in event '%s' for %s",
+                    event_name,
+                    target.__class__.__name__,
+                )
 
         # 2. Call class-level listeners (including global "__all__")
         listeners = (
@@ -83,7 +90,11 @@ class Events:
             try:
                 callback(target)
             except Exception as e:
-                print(f"Error in class-level event '{event_name}' for {target.__class__.__name__}: {e}")
+                _logger.exception(
+                    "Error in class-level event '%s' for %s",
+                    event_name,
+                    target.__class__.__name__,
+                )
 
     # ----------------------------------------------------------------------
     # Lifecycle Events
@@ -170,4 +181,4 @@ class Events:
             try:
                 handler(event)
             except Exception as e:
-                print(f"[DomainEvent Error] {handler} failed: {e}")
+                _logger.exception("[DomainEvent Error] %s failed", handler)

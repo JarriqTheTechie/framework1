@@ -1,5 +1,6 @@
 import inspect
 import pprint
+import html
 from typing import List, Callable, Optional, Any
 
 from framework1.dsl.FormDSL.Validation import ValidationRule
@@ -29,6 +30,13 @@ class BaseField:
         self.outer_class = ""
         self.label_position = "above"  # Default position for label
         self.help_text_position = "below"
+        # HTML5 validation hints
+        self._required_attr: bool = False
+        self._minlength: int | None = None
+        self._maxlength: int | None = None
+        self._pattern: str | None = None
+        # Declarative conditional visibility rules used by Form graph precompile.
+        self._conditional_rules: List[dict] = []
 
     def set_name(self, name: str):
         """Set the name of the field."""
@@ -83,7 +91,9 @@ class BaseField:
 
     def explode_data_attributes(self) -> str:
         """Return all data attributes in HTML format."""
-        return " ".join([f'{key}="{value}"' for key, value in self.data_attributes.items()])
+        return " ".join(
+            [f'{html.escape(str(key))}="{html.escape(str(value))}"' for key, value in self.data_attributes.items()]
+        )
 
     def set_help_text(self, help_text: str | Callable) -> 'BaseField':
         """Set help text for the field, displayed below the label."""
@@ -129,20 +139,24 @@ class BaseField:
 
     def is_required(self, error_message="This field is required.") -> 'BaseField':
         """Add a 'required' validation rule."""
+        self._required_attr = True
         return self.add_validation(lambda v: v is not None and v != "", error_message)
 
     def min_length(self, length: int, error_message=None) -> 'BaseField':
         """Add a 'min_length' validation rule."""
+        self._minlength = length
         error_message = error_message or f"Must be at least {length} characters long."
         return self.add_validation(lambda v: v is not None and len(v) >= length, error_message)
 
     def max_length(self, length: int, error_message=None) -> 'BaseField':
         """Add a 'max_length' validation rule."""
+        self._maxlength = length
         error_message = error_message or f"Must be at most {length} characters long."
         return self.add_validation(lambda v: v is not None and len(v) <= length, error_message)
 
     def pattern(self, regex: str, error_message="Invalid format.") -> 'BaseField':
         """Add a 'pattern' validation rule using a regex."""
+        self._pattern = regex
         import re
         return self.add_validation(lambda v: re.match(regex, v) is not None, error_message)
 
@@ -160,8 +174,9 @@ class BaseField:
             header_text = self.header(record, data)
         else:
             header_text = self.header
+        header_text = "" if header_text is None else html.escape(str(header_text))
         return f"""
-        <label class="{self.label_class} {self.field_hidden}" for="{self.name}">
+        <label class="{html.escape(self.label_class)} {self.field_hidden}" for="{html.escape(self.name)}">
             {header_text}
         </label> 
         """
@@ -169,10 +184,10 @@ class BaseField:
     def render_help_text(self, record=None, data=None) -> str:
         if callable(self.help_text):
             # If help_text is a callable, we assume it will be called later with the record and data
-            help_text_html = f'<small class="help-text">{self.help_text(record, data)}</small>'
+            help_text_html = f'<small class="help-text">{html.escape(str(self.help_text(record, data)))}</small>'
         elif isinstance(self.help_text, str):
             # If help_text is a string, we render it directly
-            help_text_html = f'<small class="help-text">{self.help_text}</small>'
+            help_text_html = f'<small class="help-text">{html.escape(self.help_text)}</small>'
         return help_text_html
 
     def set_help_text_position(self, position: str) -> 'BaseField':
@@ -193,6 +208,10 @@ class BaseField:
 
     def modify_using(self, modify_using_: callable):
         self.__modify_using_ = modify_using_
+        try:
+            self.__modify_using_arity = len(inspect.signature(modify_using_).parameters)
+        except Exception:
+            self.__modify_using_arity = 1
         return self
 
     def visible_on(self, boolean: bool) -> 'BaseField':
@@ -200,14 +219,68 @@ class BaseField:
         self.visible = boolean
         return self
 
+    def add_visibility_condition(
+        self,
+        depends_on: str | List[str],
+        operator: str = "equals",
+        value: Any = None,
+        mode: str = "show",
+    ) -> "BaseField":
+        """
+        Register a declarative visibility condition for frontend evaluation.
+        This does not evaluate on the server; Form precompiles all rules into
+        a dependency graph for faster client-side wiring.
+        """
+        if isinstance(depends_on, str):
+            sources = [depends_on]
+        else:
+            sources = [str(s) for s in depends_on if s is not None and str(s).strip() != ""]
+
+        rule = {
+            "target": str(self.name),
+            "sources": sources,
+            "operator": str(operator),
+            "value": value,
+            "mode": str(mode),
+        }
+        self._conditional_rules.append(rule)
+        return self
+
+    def show_when(
+        self,
+        depends_on: str | List[str],
+        operator: str = "equals",
+        value: Any = None,
+    ) -> "BaseField":
+        """Convenience wrapper for a show-when rule."""
+        return self.add_visibility_condition(depends_on, operator=operator, value=value, mode="show")
+
+    def hide_when(
+        self,
+        depends_on: str | List[str],
+        operator: str = "equals",
+        value: Any = None,
+    ) -> "BaseField":
+        """Convenience wrapper for a hide-when rule."""
+        return self.add_visibility_condition(depends_on, operator=operator, value=value, mode="hide")
+
+    def get_visibility_conditions(self) -> List[dict]:
+        return list(self._conditional_rules)
+
     def _format_value(self, value, record):
         if value is None or value == "":
             value = self.__value_if_missing
 
         if self.__modify_using_:
-            sig = inspect.signature(self.__modify_using_)
+            arity = getattr(self, "__modify_using_arity", None)
+            if arity is None:
+                try:
+                    arity = len(inspect.signature(self.__modify_using_).parameters)
+                except Exception:
+                    arity = 1
+                self.__modify_using_arity = arity
             try:
-                if len(sig.parameters) == 2:
+                if arity == 2:
                     return self.__modify_using_(value, record)
                 else:
                     return self.__modify_using_(value)
@@ -230,41 +303,42 @@ class BaseField:
         self.label_position = position
         return self
 
-    def inherit_controller_from(self, parent):
-        """Inherit parent controller name so .target() and .value() resolve correctly."""
-        self._stimulus_controller = getattr(parent, "_stimulus_controller", None)
-        return self
-
-    def target(self, name: str, controller: str|None) -> 'BaseField':
-        if controller is None:
-            controller = getattr(self, "_stimulus_controller", None)
-        else:
-            if isinstance(controller, str):
-                controller = controller
-            else:
-                controller = getattr(controller, "_stimulus_controller", None)
-        if not controller:
-            raise ValueError(f"Stimulus controller not set for {self.name}.")
-        self.set_data_attribute(f"data-{controller}-target", name)
-        return self
-
     def render_input(self, value="", record={}) -> str:
         readonly_attr = " readonly" if self.readonly else ""
         disabled_attr = " disabled" if self.disabled else ""
-        modified_value = self._format_value(value, record)
+        required_attr = " required" if self._required_attr else ""
+        minlength_attr = f' minlength="{self._minlength}"' if self._minlength is not None else ""
+        maxlength_attr = f' maxlength="{self._maxlength}"' if self._maxlength is not None else ""
+        pattern_attr = f' pattern="{html.escape(self._pattern)}"' if self._pattern is not None else ""
+        min_attr = ""
+        max_attr = ""
+        step_attr = ""
+        # Add numeric constraints when applicable
+        if self.field_type == "number":
+            min_val = self.data_attributes.get("min")
+            max_val = self.data_attributes.get("max")
+            step_val = getattr(self, "step", None)
+            min_attr = f' min="{html.escape(str(min_val))}"' if min_val is not None else ""
+            max_attr = f' max="{html.escape(str(max_val))}"' if max_val is not None else ""
+            step_attr = f' step="{html.escape(str(step_val))}"' if step_val is not None else ""
+        modified_value = html.escape(str(self._format_value(value, record)))
+        escaped_name = html.escape(self.name)
+        escaped_class = html.escape(self.class_name)
+        escaped_style = html.escape(self.style)
+        hidden_attr = html.escape(self.hidden)
         # raise Exception(self.render_label(record, modified_value))
         if self.visible:
             return f"""
             {self.render_label(record, modified_value) if self.label_position == "above" else ""}
             {self.render_help_text(record, modified_value) if self.help_text and self.help_text_position == "above" else ""}
-            <input type="{self.field_type}" 
-                   id="{self.name}" 
-                   name="{self.name}" 
+            <input type="{html.escape(self.field_type)}" 
+                   id="{escaped_name}" 
+                   name="{escaped_name}" 
                    {self.explode_data_attributes()} 
                    value="{modified_value}" 
-                   class="{self.class_name}" 
-                   style="{self.style}"
-                   {readonly_attr}{disabled_attr} {self.hidden}/>
+                   class="{escaped_class}" 
+                   style="{escaped_style}"
+                   {readonly_attr}{disabled_attr}{required_attr}{minlength_attr}{maxlength_attr}{pattern_attr}{min_attr}{max_attr}{step_attr} {hidden_attr}/>
             {self.render_label(record, modified_value) if self.label_position == "below" else ""}
             {self.render_help_text(record, modified_value) if self.help_text and self.help_text_position == "below" else ""}
             {self.script}

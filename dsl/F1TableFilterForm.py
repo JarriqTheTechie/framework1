@@ -2,6 +2,7 @@ import pprint
 import importlib
 import importlib.util
 import sys
+import json
 from framework1.database.QueryBuilder import QueryBuilder
 from framework1.database.active_record.utils.ModelCollection import ModelCollection
 from framework1.dsl.FormDSL.SelectField import SelectField
@@ -54,6 +55,8 @@ class F1TableFilterForm(Form):
         self.model = table.__class__.model
         self.db_table = table.__class__.model.__table__
         self.database = table.__class__.model.__database__
+        self.filter_field_meta = getattr(table.__class__, "filter_field_meta", {}) or {}
+        self.filter_presets = getattr(table.__class__, "filter_presets", {}) or {}
         try:
             self.database_schema = table.__class__.model.__database__.connection_dict['database']
         except KeyError:
@@ -90,6 +93,14 @@ class F1TableFilterForm(Form):
             return resource, self
         return None, self
 
+    def _infer_type(self, column_name: str, raw_type: str) -> str:
+        raw = raw_type.lower()
+        if any(tok in raw for tok in ["int", "decimal", "numeric", "float", "double", "real"]):
+            return "number"
+        if any(tok in raw for tok in ["date", "time"]):
+            return "date"
+        return "string"
+
     def schema(self) -> List[BaseField | FieldGroup]:
         if self.information_schema.__driver__ == "mysql":
             table_name = self.db_table.replace(f"{self.database_schema}.", "")
@@ -103,12 +114,72 @@ class F1TableFilterForm(Form):
                 "TABLE_SCHEMA", "dbo").order_by("ORDINAL_POSITION").all()
 
         table_columns_ = []
+        option_label_map = {}
+        option_type_map = {}
+
         for column in table_columns:
             for user_defined_filter_field in self.table.filterable_fields:
                 if column.COLUMN_NAME == user_defined_filter_field.split(".")[-1]:
+                    meta = self.filter_field_meta.get(user_defined_filter_field, {})
+                    label = meta.get("label", user_defined_filter_field.replace("_", " ").title())
+                    inferred_type = meta.get(
+                        "type",
+                        self._infer_type(column.COLUMN_NAME, getattr(column, "DATA_TYPE", str(column)))
+                    )
                     table_columns_.append(user_defined_filter_field)
+                    option_label_map[user_defined_filter_field] = label
+                    option_type_map[user_defined_filter_field] = inferred_type
 
+        # Fallback: accept meta-defined fields not present in information schema
+        for user_defined_filter_field, meta in self.filter_field_meta.items():
+            if user_defined_filter_field not in table_columns_:
+                table_columns_.append(user_defined_filter_field)
+                option_label_map[user_defined_filter_field] = meta.get(
+                    "label", user_defined_filter_field.replace("_", " ").title())
+                option_type_map[user_defined_filter_field] = meta.get("type", "string")
+
+        # Build operator options list once; JS will prune per field type
+        operator_options = [
+            ("where", "Equals"),
+            ("not_equal", "Not Equals"),
+            ("contains", "Contains"),
+            ("starts_with", "Starts With"),
+            ("ends_with", "Ends With"),
+            ("greater_than", "Greater Than"),
+            ("less_than", "Less Than"),
+            ("greater_than_eq", "Greater Than or Equal"),
+            ("less_than_eq", "Less Than or Equal"),
+            ("in", "In List"),
+            ("not_in", "Not In List"),
+            ("between", "Between"),
+            ("is_null", "Is Null"),
+            ("is_not_null", "Is Not Null"),
+        ]
+
+        presets_json = json.dumps(self.filter_presets)
+        field_meta_json = json.dumps(option_type_map)
         return [
+            RawField("").default(
+                """
+                <div class="d-flex align-items-center justify-content-between mb-2">
+                    <div class="fw-bold">Filter Presets</div>
+                    <div class="d-flex gap-2 align-items-center">
+                        <select id="presetSelector" class="form-select form-select-sm w-auto">
+                            <option value="">Select preset…</option>
+                        </select>
+                        <button type="button" class="btn btn-outline-secondary btn-sm" id="clearFiltersBtn">
+                            Clear
+                        </button>
+                    </div>
+                </div>
+                """
+            ),
+            RawField("").default(
+                f'<input type="hidden" id="filterFieldMeta" value=\'{field_meta_json}\'>'
+            ),
+            RawField("").default(
+                f'<input type="hidden" id="filterPresets" value=\'{presets_json}\'>'
+            ),
             FieldGroup(
                 f"",
                 fields=[
@@ -119,27 +190,15 @@ class F1TableFilterForm(Form):
                         "form-select form-select-sm w-auto"),
                     SelectField(f"field[]").set_label("Field Name").set_class(
                         "form-select form-select-sm").set_options([
-                        column for column in table_columns_
+                        (column, option_label_map.get(column, column))
+                        for column in table_columns_
                     ]),
 
                     SelectField(f"operator[]").set_label("Operator").set_class(
-                        "form-select form-select-sm w-auto").set_options([
-                        ("where", "Equals"),
-                        ("not_equal", "Not Equals"),
-                        ("contains", "Contains"),
-                        ("starts_with", "Starts With"),
-                        ("ends_with", "Ends With"),
-                        ("greater_than", "Greater Than"),
-                        ("less_than", "Less Than"),
-                        ("greater_than_eq", "Greater Than or Equal"),
-                        ("less_than_eq", "Less Than or Equal"),
-                        ("in", "In List"),
-                        ("not_in", "Not In List"),
-                        ("between", "Between"),
-                        ("is_null", "Is Null"),
-                        ("is_not_null", "Is Not Null"),
-                    ]),
-                    TextField(f"value[]").set_label("Value").set_class("form-control form-control-sm"),
+                        "form-select form-select-sm w-auto").set_options(operator_options),
+                    RawField(f"value_wrapper").default(
+                        '<input name="value[]" type="text" class="form-control form-control-sm" />'
+                    ),
                     RawField("").default(
                         '<i class="ri-close-circle-line remove-btn" onclick="removeFilterRow(this)"></i>')
                 ]
@@ -155,7 +214,7 @@ class F1TableFilterForm(Form):
                         <button type="button" class="btn btn-outline-primary btn-sm mt-2" onclick="addFilterRow()">
                             <i class="ri-add-line me-1"></i> Add Condition
                         </button>
-    
+
                         <!-- Action Buttons -->
                         <div class="filter-actions mt-4 d-flex justify-content-between">
                             <button type="reset" class="btn btn-outline-secondary btn-sm">

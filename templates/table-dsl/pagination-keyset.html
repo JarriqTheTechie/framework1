@@ -1,0 +1,23 @@
+<nav aria-label="Cursor pagination" class="mt-3">
+    <div class="d-flex align-items-center justify-content-between">
+        <div class="pagination-info">
+            Showing {{ data|length }} items
+        </div>
+        <ul class="pagination mb-0">
+            <li class="page-item {% if not current_cursor %}disabled{% endif %}">
+                <a class="page-link"
+                   href="{{ request.clean_table_url(table_name, {cursor_param: None}) }}"
+                   {% if not current_cursor %}tabindex="-1"{% endif %}>
+                    First
+                </a>
+            </li>
+            <li class="page-item {% if not has_next %}disabled{% endif %}">
+                <a class="page-link"
+                   href="{{ request.clean_table_url(table_name, {cursor_param: next_cursor}) if has_next else '#' }}"
+                   {% if not has_next %}tabindex="-1"{% endif %}>
+                    Next
+                </a>
+            </li>
+        </ul>
+    </div>
+</nav>

@@ -21,6 +21,8 @@ available via `framework1.dsl.Table`.
   Excel export handling.
 - `render.py`:
   HTML rendering helpers (header, body, pagination).
+- `actions.py`:
+  `TableAction` helper for row actions.
 - `routes.py`:
   Table-related routes (`TableExportExcel`, `TableDeleteBulk`).
 - `utils.py`:
@@ -31,3 +33,4 @@ available via `framework1.dsl.Table`.
 - Keep public API names intact in `framework1/dsl/Table.py`.
 - Add new features in the smallest module that matches the responsibility.
 - Avoid cross-module imports unless required to prevent circular dependencies.
+- Column visibility: mark columns `toggleable()` to expose in the column picker; choices persist via session.

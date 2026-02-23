@@ -1,4 +1,5 @@
 from typing import Tuple, Union, List, Self, Dict
+import html
 
 from framework1.dsl.FormDSL.BaseField import BaseField
 
@@ -23,14 +24,15 @@ class CheckboxField(BaseField):
 
         disabled_attr = " disabled" if self.disabled else ""
         value_set = set(value if isinstance(value, list) else [value])
+        escaped_name = html.escape(self.name)
 
         checkboxes_html = "".join(
             f'''
-            <div class="{self.outer_class}">
-                <input class="form-check-input {self.class_name}" type="checkbox" 
-                       name="{self.name}[]" id="{self.name}_{i}" value="{val}" 
+            <div class="{html.escape(self.outer_class)}">
+                <input class="form-check-input {html.escape(self.class_name)}" type="checkbox" 
+                       name="{escaped_name}[]" id="{escaped_name}_{i}" value="{html.escape(str(val))}" 
                        {"checked" if val in value_set else ""} {self.explode_data_attributes()}{disabled_attr}>
-                <label class="form-check-label" for="{self.name}_{i}">{lbl}</label>
+                <label class="form-check-label" for="{escaped_name}_{i}">{html.escape(str(lbl))}</label>
             </div>
             '''
             for i, (val, lbl) in enumerate(self._generate_option_html(self.options))
